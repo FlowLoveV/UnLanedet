@@ -46,13 +46,15 @@ python setup.py build develop
 
 ```Shell
 # git clone https://github.com/zkyntu/UnLanedet.git
+cd UnLanedet
 conda create -n unlanedet python=3.9 -y
 conda activate unlanedet
-conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
-cd UnLanedet
+conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia -y
+conda install cuda-toolkit=12.1 -c nvidia -y
 pip install -r requirements.txt
-# pip install numpy==1.23.1
+pip install numpy==1.23.1
 pip install hydra-core --upgrade
+pip install cython pytest-runner ninja
 python setup.py build develop
 ```
 

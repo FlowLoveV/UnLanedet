@@ -11,6 +11,12 @@ dos2unix scripts/train.sh scripts/eval.sh scripts/resume_train.sh
 bash scripts/train.sh path_to_config num_gpus
 # 8 cards training example 
 # bash scripts/train.sh config/clrnet/resnet34_culane.py 8
+
+```
+# clrnet
+CUDA_VISIBLE_DEVICES=4,5,6,7 python tools/train_net.py --config-file config/clrnet/resnet34_culane.py --num-gpus 4
+```
+
 ```
 
 ### Evaluation
