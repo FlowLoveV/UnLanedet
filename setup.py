@@ -1,9 +1,21 @@
 import setuptools
 import sys
 import glob
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
-import unlanedet
+# 条件导入torch，避免在构建环境中导入失败
+try:
+    from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+    _has_torch = True
+except ImportError:
+    _has_torch = False
+    CUDAExtension = None
+    BuildExtension = None
+
+# 避免在构建过程中导入unlanedet，因为可能缺少依赖
+try:
+    import unlanedet
+except ImportError:
+    unlanedet = None
 
 long_description = "A Tookit for lane detection based on PyTorch"
 
@@ -12,7 +24,11 @@ with open("requirements.txt") as file:
 
 def get_extensions():
     extensions = []
-
+    
+    # 如果torch不可用，返回空扩展列表
+    if not _has_torch:
+        return extensions
+    
     op_files = glob.glob('./unlanedet/layers/ops/csrc/*.c*')
     op_files_ad = glob.glob('./unlanedet/layers/ops/csrc/adnet/*.c*')
     op_files_sr = glob.glob('./unlanedet/layers/ops/csrc/srnet/*.c*')
@@ -88,6 +104,6 @@ setuptools.setup(
     ],
     tests_require=['pytest'],
     ext_modules=get_extensions(),
-    cmdclass={'build_ext': BuildExtension},
+    cmdclass={'build_ext': BuildExtension} if _has_torch else {},
     license='Apache 2.0 license',
     entry_points={'console_scripts': ['unlanedet=unlanedet.command:main', ]})
