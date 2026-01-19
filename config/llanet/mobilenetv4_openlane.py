@@ -20,7 +20,7 @@ if "--num-gpus" in sys.argv:
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 40
+TARGET_BATCH_PER_GPU = 48
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
