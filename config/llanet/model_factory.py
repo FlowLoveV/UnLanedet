@@ -7,11 +7,33 @@ import os
 import random
 import numpy as np
 import torch
+import timm
 from unlanedet.config import LazyCall as L
-from unlanedet.model.LLANet.mobilenetv4_small import MobileNetV4Small
 from unlanedet.model.LLANet.llanet_head import LLANetHead
 from unlanedet.model.LLANet.gsa_fpn import GSAFPN
 from unlanedet.model.LLANet.llanet import LLANet
+
+
+class TimmMobileNetV4Wrapper(torch.nn.Module):
+    """timm MobileNetV4 wrapper to match our interface."""
+
+    def __init__(
+        self,
+        model_name="mobilenetv4_conv_small.e2400_r224_in1k",
+        pretrained=True,
+        features_only=True,
+        out_indices=[2, 3, 4],
+    ):
+        super().__init__()
+        self.model = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=features_only,
+            out_indices=out_indices,
+        )
+
+    def forward(self, x):
+        return self.model(x)
 
 
 def create_llanet_model(cfg):
@@ -32,11 +54,19 @@ def create_llanet_model(cfg):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # 创建模型
+    # 决定是否使用 ImageNet 预训练
+    use_pretrained = getattr(cfg, "use_pretrained_backbone", True)  # 默认使用预训练
+
+    # 创建模型 - 使用 timm 的 MobileNetV4
     model = L(LLANet)(
-        backbone=L(MobileNetV4Small)(width_mult=1.0),
+        backbone=L(TimmMobileNetV4Wrapper)(
+            model_name="mobilenetv4_conv_small.e2400_r224_in1k",
+            pretrained=use_pretrained,
+            features_only=True,
+            out_indices=[2, 3, 4],  # 输出 stride 8, 16, 32 的特征
+        ),
         neck=L(GSAFPN)(
-            in_channels=[128, 256, 512],
+            in_channels=[64, 96, 960],  # timm mobilenetv4_conv_small 的输出通道
             out_channels=64,
             num_outs=3,
             scm_kernel_size=3,

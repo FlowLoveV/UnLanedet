@@ -25,18 +25,9 @@ TARGET_BATCH_PER_GPU = 48
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
 
-print(f"\n[Config] Detected {runtime_num_gpus} GPUs.")
-print(
-    f"[Config] Auto-adjusting: Workers/GPU={safe_workers_per_gpu}, TotalBatchSize={dynamic_total_batch_size}\n"
-)
-
 from ..modelzoo import get_config
 from omegaconf import OmegaConf
 from unlanedet.config import LazyCall as L
-from unlanedet.model.LLANet.mobilenetv4_small import MobileNetV4Small
-from unlanedet.model.LLANet.llanet_head import LLANetHead
-from unlanedet.model.LLANet.gsa_fpn import GSAFPN
-from unlanedet.model.LLANet.llanet import LLANet
 from unlanedet.data.transform import *
 from unlanedet.data.transform.generate_lane_line_openlane import (
     GenerateLaneLineOpenLane,
@@ -111,6 +102,7 @@ param_config.num_classes = num_classes
 param_config.num_lane_categories = num_lane_categories
 param_config.num_lr_attributes = num_lr_attributes
 param_config.num_priors = num_priors
+param_config.use_pretrained_backbone = True  # 是否使用 ImageNet 预训练权重
 
 # Model
 model = create_llanet_model(param_config)

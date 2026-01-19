@@ -6,7 +6,6 @@ Combines MobileNetV4-Small backbone, GSA-FPN neck, and LLANetHead into a single 
 
 import torch.nn as nn
 
-from .mobilenetv4_small import MobileNetV4Small
 from .gsa_fpn import GSAFPN
 from .llanet_head import LLANetHead
 
@@ -21,7 +20,7 @@ class LLANet(nn.Module):
         self.head = head
 
     def forward(self, data):
-        img = data['img']  # Extract image tensor from data dict
+        img = data["img"]  # Extract image tensor from data dict
         features = self.backbone(img)
         neck_features = self.neck(features)
 
@@ -33,4 +32,3 @@ class LLANet(nn.Module):
         else:
             # During inference, forward returns predictions
             return self.head(neck_features)
-
