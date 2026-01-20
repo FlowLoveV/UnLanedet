@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from scipy.optimize import linear_sum_assignment
 from .evaluator import DatasetEvaluator
+from ..model.LLANet.line_iou import line_iou
 
 
 def lane_nms(predictions, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920):
@@ -94,6 +95,13 @@ class OpenLaneEvaluator(DatasetEvaluator):
         self.result_dir = os.path.join(self.output_dir, "validation")
         self.test_list_path = os.path.join(self.output_dir, "test_list.txt")
 
+        # Visualization directories for annotated images
+        self.visualization_dir = os.path.join(self.output_dir, "visualization")
+        self.annotated_images_dir = os.path.join(
+            self.visualization_dir, "annotated_images"
+        )
+        self.script_path = cfg.parse_evaluate_result_script
+
         # 2. Category Mapping (Model 0-14 -> OpenLane Official IDs)
         self.id_to_openlane_cat = {
             0: 0,
@@ -118,6 +126,9 @@ class OpenLaneEvaluator(DatasetEvaluator):
         self.num_attributes = cfg.num_lr_attributes
         self._created_dirs = set()
 
+        # Configuration for visualization
+        self.generate_visualization = getattr(cfg, "generate_visualization", False)
+
         self.reset()
 
     def reset(self):
@@ -135,10 +146,19 @@ class OpenLaneEvaluator(DatasetEvaluator):
                     shutil.rmtree(self.result_dir)
                 if os.path.exists(self.test_list_path):
                     os.remove(self.test_list_path)
+                if os.path.exists(self.visualization_dir):
+                    shutil.rmtree(self.visualization_dir)
             except Exception as e:
                 self.logger.warning(f"Failed to clean output dir: {e}")
 
         os.makedirs(self.result_dir, exist_ok=True)
+
+        # Create visualization directories if needed
+        if self.generate_visualization:
+            os.makedirs(self.annotated_images_dir, exist_ok=True)
+            self.logger.info(
+                f"[OpenLaneEvaluator] Visualization enabled. Annotated images will be saved to: {self.annotated_images_dir}"
+            )
 
     def process(self, inputs, outputs):
         batch_size = len(outputs)
@@ -199,6 +219,10 @@ class OpenLaneEvaluator(DatasetEvaluator):
             if len(pred_lines) == 0:
                 self._save_empty_json(save_rel_path, original_rel_path)
                 continue
+
+            # 处理维度：如果 pred_lines 是 3D tensor [batch, num_priors, dim]，取第一个样本
+            if pred_lines.dim() == 3:
+                pred_lines = pred_lines[0]  # [num_priors, dim]
 
             # --- 3. Softmax 处理 (关键步骤) ---
             # 原始输出前两列是 Logits，必须转概率
@@ -288,6 +312,52 @@ class OpenLaneEvaluator(DatasetEvaluator):
         with open(save_path, "w") as f:
             json.dump(content, f)
 
+        # Generate visualization if enabled
+        if self.generate_visualization:
+            self._generate_visualization(rel_path, content)
+
+    def _generate_visualization(self, rel_path, json_content):
+        """
+        Generate annotated images using tools/read_open2d_csv_results.py
+        """
+        try:
+            # Extract image filename from rel_path
+            img_filename = os.path.basename(rel_path).replace(".json", ".jpg")
+
+            # Path to the read_open2d_csv_results.py script
+            script_path = self.script_path
+
+            if not os.path.exists(script_path):
+                self.logger.warning(f"Visualization script not found: {script_path}")
+                return
+
+            # Prepare command to generate visualization
+            # The script expects to read from csv_results/, so we need to run evaluation first
+            # For now, we'll create a placeholder to indicate this should be called after evaluation
+            vis_cmd = [
+                "python",
+                script_path,
+                "--csv-folder",
+                os.path.join(self.output_dir, "csv_results"),
+                "--visualize",
+                "--output-dir",
+                self.annotated_images_dir,
+            ]
+
+            # Store visualization command for later execution
+            if not hasattr(self, "_vis_commands"):
+                self._vis_commands = []
+            self._vis_commands.append(
+                {
+                    "cmd": vis_cmd,
+                    "img_filename": img_filename,
+                    "json_content": json_content,
+                }
+            )
+
+        except Exception as e:
+            self.logger.warning(f"Failed to prepare visualization for {rel_path}: {e}")
+
     def _save_empty_json(self, rel_path, full_path):
         self._write_json(rel_path, {"file_path": full_path, "lane_lines": []})
 
@@ -337,6 +407,14 @@ class OpenLaneEvaluator(DatasetEvaluator):
         else:
             metrics = self._run_official_evaluation()
 
+            # Generate visualizations after evaluation if enabled
+            if (
+                self.generate_visualization
+                and hasattr(self, "_vis_commands")
+                and self._vis_commands
+            ):
+                self._execute_visualizations()
+
         # Merge Internal Python Metrics
         local_metrics = self._get_internal_metrics()
         metrics.update(local_metrics)
@@ -347,7 +425,74 @@ class OpenLaneEvaluator(DatasetEvaluator):
             self.logger.info(f"{k}: {v:.4f}")
         self.logger.info("=" * 40)
 
+        # Log visualization results
+        if self.generate_visualization:
+            self.logger.info(
+                f"[OpenLaneEvaluator] Visualizations saved to: {self.annotated_images_dir}"
+            )
+
         return metrics
+
+    def _execute_visualizations(self):
+        """
+        Execute visualization generation after evaluation completes
+        """
+        try:
+            # First run the official evaluation to generate csv_results/
+            self.logger.info(
+                "[OpenLaneEvaluator] Running evaluation to generate CSV results for visualization..."
+            )
+
+            # The CSV results should already be generated by _run_official_evaluation
+            csv_results_dir = os.path.join(self.output_dir, "csv_results")
+
+            if not os.path.exists(csv_results_dir):
+                self.logger.warning(
+                    f"CSV results directory not found: {csv_results_dir}"
+                )
+                return
+
+            # Generate visualizations using read_open2d_csv_results.py
+            script_path = self.script_path
+
+            if not os.path.exists(script_path):
+                self.logger.warning(f"Visualization script not found: {script_path}")
+                return
+
+            # Create visualization command
+            vis_cmd = [
+                "python",
+                script_path,
+                "--csv-folder",
+                csv_results_dir,
+                "--plot",
+                os.path.join(self.visualization_dir, "performance.png"),
+                "--excel",
+                os.path.join(self.visualization_dir, "evaluation_results.xlsx"),
+            ]
+
+            self.logger.info(
+                f"[OpenLaneEvaluator] Generating evaluation plots and Excel report..."
+            )
+
+            # Execute visualization command
+            result = subprocess.run(
+                vis_cmd, capture_output=True, text=True, timeout=300
+            )
+
+            if result.returncode == 0:
+                self.logger.info(
+                    f"[OpenLaneEvaluator] Evaluation visualization completed successfully"
+                )
+            else:
+                self.logger.warning(
+                    f"[OpenLaneEvaluator] Visualization generation had issues: {result.stderr}"
+                )
+
+        except Exception as e:
+            self.logger.warning(
+                f"[OpenLaneEvaluator] Failed to execute visualizations: {e}"
+            )
 
     def _run_official_evaluation(self):
         lane_anno_dir = getattr(self.cfg, "lane_anno_dir", "lane3d_300/")

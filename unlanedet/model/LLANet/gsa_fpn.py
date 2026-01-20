@@ -92,9 +92,14 @@ class SCModule(nn.Module):
         )
 
         # 注意力权重生成 (att_weight 通道数需与 context_feat 一致)
+        # 修改：移除内部 Sigmoid，并在 forward 中手动添加
         self.att_conv = Conv2d(
-            out_channels, out_channels, kernel_size=1, activation=nn.Sigmoid()
+            out_channels, out_channels, kernel_size=1, activation=None
         )
+        # 初始化为 0，使得 Sigmoid 输出 0.5，特征初始时能流过
+        nn.init.constant_(self.att_conv.weight, 0)
+        if self.att_conv.bias is not None:
+            nn.init.constant_(self.att_conv.bias, 0)
 
     def forward(self, x):
         # 非对称卷积提取条带上下文特征并投影维度
@@ -102,11 +107,11 @@ class SCModule(nn.Module):
         context_feat = self.asym_conv(x)
 
         # 生成空间注意力权重
-        att_weight = self.att_conv(context_feat)
-
-        # 应用注意力权重到变换后的特征上
-        attended_feat = context_feat * att_weight
-        return attended_feat
+        att_weight = torch.sigmoid(self.att_conv(context_feat))
+        
+        # 修改：添加残差连接 (Residual Connection)
+        # 这样即使 Attention 没学好，主干特征也不会丢失
+        return context_feat + (context_feat * att_weight)
 
 
 class GSAFPN(nn.Module):

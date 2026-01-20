@@ -330,22 +330,6 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore")
 
-    print("=== LLANet Model Analysis ===\n")
-
-    # Import models at runtime to avoid circular imports
-    try:
-        print("Loading ResNet18-LLANet...")
-        resnet18_module = __import__(
-            "config.llanet.resnet18_openlane", fromlist=["model"]
-        )
-        resnet18_model = resnet18_module.model
-        print("ResNet18-LLANet loaded!\n")
-    except Exception as e:
-        print(f"Failed to load ResNet18: {e}")
-        import sys
-
-        sys.exit(1)
-
     try:
         print("Loading MobileNetV4-LLANet...")
         mobile_module = __import__(
@@ -360,12 +344,5 @@ if __name__ == "__main__":
     # Analyze ResNet18
     print("Analyzing ResNet18-LLANet...")
     analyze_model(
-        resnet18_model, input_shape=(1, 3, 320, 800), model_name="ResNet18-LLANet"
+        mobilenetv4_model, input_shape=(1, 3, 320, 800), model_name="MobileNetV4-LLANet"
     )
-
-    # Compare both models if available
-    if mobilenetv4_model is not None:
-        print("\nComparing Both Models...")
-        compare_models(
-            {"ResNet18-LLANet": resnet18_model, "MobileNetV4-LLANet": mobilenetv4_model}
-        )

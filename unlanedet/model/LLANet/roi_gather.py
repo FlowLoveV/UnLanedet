@@ -38,7 +38,7 @@ class ROIGather(nn.Module):
         sample_points,
         fc_hidden_dim,
         refine_layers,
-        mid_channels=64,
+        mid_channels=64,  # 给一个默认值，但通常会被覆盖
         norm_type="BN",
     ):
         super(ROIGather, self).__init__()

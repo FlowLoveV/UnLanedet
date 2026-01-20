@@ -114,7 +114,7 @@ class OpenLane(BaseDataset):
         """
         # 从配置中获取 lane_anno_dir，默认为 lane3d_300
         lane_anno_dir = self.cfg.get("lane_anno_dir", "lane3d_300/")
-        
+
         if split == "train":
             anno_dirs = [osp.join(self.data_root, lane_anno_dir, "training")]
         elif split == "val" or split == "test":
@@ -193,7 +193,14 @@ class OpenLane(BaseDataset):
                             & (v_coords < self.target_h)
                         )
                     else:
-                        valid_mask = (v_coords >= self.cut_height) & (u_coords > 0)
+                        # 非预处理模式：检查坐标是否在有效区域内
+                        # v >= cut_height 且 v < ori_h, u > 0 且 u < ori_w
+                        valid_mask = (
+                            (v_coords >= self.cut_height) 
+                            & (v_coords < self.ori_h)
+                            & (u_coords > 0) 
+                            & (u_coords < self.ori_w)
+                        )
 
                     u_valid = u_coords[valid_mask]
                     v_valid = v_coords[valid_mask]

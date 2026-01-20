@@ -43,13 +43,26 @@ from .model_factory import create_llanet_model
 
 opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
 
-# === Loss Weights ===
-iou_loss_weight = 1.0
-cls_loss_weight = 0.8
-xyt_loss_weight = 1.0
-seg_loss_weight = 0.8
-category_loss_weight = 0.5
+iou_loss_weight = 2.0
+cls_loss_weight = 2.0
+xyt_loss_weight = 0.2
+seg_loss_weight = 1.0
+category_loss_weight = 2.0
 attribute_loss_weight = 0.5
+
+# SimOTA dynamic assignment weights (Geometry-Aware)
+# 增大几何权重，降低分类权重，让分配更关注距离而非分类置信度
+w_cls = 2.0
+w_geom = 4.0
+w_iou = 2.0
+
+# Dynamic weight scheduling (Curriculum Learning)
+# 动态权重调度（课程学习）
+start_w_cls = 0.5  # SimOTA 分类权重的起始值
+start_cls_loss_weight = 0.001  # 分类损失权重的起始值
+start_category_loss_weight = 0.001  # 类别损失权重的起始值
+start_attribute_loss_weight = 0.001  # 属性损失权重的起始值
+warmup_epochs = 5  # 预热轮数
 
 num_points = 72
 max_lanes = 24
@@ -84,6 +97,14 @@ param_config.xyt_loss_weight = xyt_loss_weight
 param_config.seg_loss_weight = seg_loss_weight
 param_config.category_loss_weight = category_loss_weight
 param_config.attribute_loss_weight = attribute_loss_weight
+param_config.w_cls = w_cls
+param_config.w_geom = w_geom
+param_config.w_iou = w_iou
+param_config.start_w_cls = start_w_cls
+param_config.start_cls_loss_weight = start_cls_loss_weight
+param_config.start_category_loss_weight = start_category_loss_weight
+param_config.start_attribute_loss_weight = start_attribute_loss_weight
+param_config.warmup_epochs = warmup_epochs
 param_config.num_points = num_points
 param_config.max_lanes = max_lanes
 param_config.sample_y = [i for i in range(589, 230, -20)]
@@ -103,15 +124,14 @@ param_config.num_classes = num_classes
 param_config.num_lane_categories = num_lane_categories
 param_config.num_lr_attributes = num_lr_attributes
 param_config.num_priors = num_priors
-# Model
-model = create_llanet_model(param_config)
+
 
 # Training Config
 train = get_config("config/common/train.py").train
 epochs = 15
 
 # Dataset size for OpenLane lane3d_300
-train_samples = 47533  # 训练集样本数
+train_samples = 45903  # 训练集样本数
 
 # Dynamic Batch Size
 batch_size = dynamic_total_batch_size
@@ -121,10 +141,18 @@ train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter * 16
 train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
+param_config.output_dir = train.output_dir
+
+# Model
+param_config.featuremap_out_channel = 64  # neck 层输出通道数目
+param_config.fc_hidden_dim = 64  # head层 全连接层隐藏层维度
+param_config.epoch_per_iter = epoch_per_iter
+param_config.assign_method = "CLRNet"  # optional GeometryAware
+model = create_llanet_model(param_config)
 
 # Optimizer
 optimizer = get_config("config/common/optim.py").AdamW
-optimizer.lr = 5e-5
+optimizer.lr = 3e-4  # 从 5e-5 提升到 3e-4，避免陷入局部最优
 optimizer.weight_decay = 1e-3
 
 lr_multiplier = L(CompositeParamScheduler)(
@@ -206,6 +234,7 @@ dataloader.test.dataset.cfg = param_config
 dataloader.test.total_batch_size = int(dynamic_total_batch_size / 2)
 dataloader.test.num_workers = safe_workers_per_gpu
 
+param_config.parse_evaluate_result_script = "tools/read_open2d_csv_results.py"
 dataloader.evaluator = L(OpenLaneEvaluator)(
     cfg=param_config,
     evaluate_bin_path="/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate",
@@ -222,3 +251,6 @@ train.ddp = dict(
     fp16_compression=False,
 )
 train.amp = dict(enabled=False)
+
+# 增加梯度裁剪 (防止 Loss 突变)
+train.clip_grad = dict(max_norm=10.0, norm_type=2)

@@ -296,6 +296,8 @@ class SimpleTrainer(TrainerBase):
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
+        data["iter"] = self.iter
+
         if self.zero_grad_before_forward:
             """
             If you need to accumulate gradients or do something similar, you can
@@ -502,6 +504,8 @@ class AMPTrainer(SimpleTrainer):
         start = time.perf_counter()
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
+
+        data["iter"] = self.iter
 
         if self.zero_grad_before_forward:
             self.optimizer.zero_grad()

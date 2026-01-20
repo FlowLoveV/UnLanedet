@@ -27,7 +27,8 @@ class LLANet(nn.Module):
         if self.training:
             # During training, forward returns outputs and losses
             outputs = self.head(neck_features)
-            losses = self.head.loss(outputs, data)
+            current_iter = data.get("iter", 0)
+            losses = self.head.loss(outputs, data, current_iter=current_iter)
             return losses
         else:
             # During inference, forward returns predictions

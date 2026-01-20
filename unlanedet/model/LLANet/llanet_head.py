@@ -6,9 +6,9 @@ import torch.nn.functional as F
 
 from ..module.head.plaindecoder import PlainDecoder
 from ..module.losses.focal_loss import FocalLoss
-from ..CLRNet.line_iou import line_iou, liou_loss
-from ..CLRNet.dynamic_assign import assign
-from ..CLRNet.roi_gather import ROIGather, LinearModule
+from .line_iou import line_iou, liou_loss
+from .dynamic_assign import assign
+from .roi_gather import ROIGather, LinearModule
 
 
 class LLANetHead(nn.Module):
@@ -26,6 +26,7 @@ class LLANetHead(nn.Module):
         enable_attribute=True,
         num_lane_categories=15,
         scale_factor=20.0,
+        detailed_loss_logger=None,
     ):
         super(LLANetHead, self).__init__()
         self.cfg = cfg
@@ -33,6 +34,7 @@ class LLANetHead(nn.Module):
         self.enable_attribute = enable_attribute
         self.num_lane_categories = num_lane_categories
         self.scale_factor = scale_factor
+        self.detailed_loss_logger = detailed_loss_logger
 
         self.img_w = 800 if cfg is None else self.cfg.img_w
         self.img_h = 320 if cfg is None else self.cfg.img_h
@@ -85,12 +87,12 @@ class LLANetHead(nn.Module):
             self.sample_points,
             self.fc_hidden_dim,
             self.refine_layers,
+            self.fc_hidden_dim,
         )
         self.reg_layers = nn.Linear(self.fc_hidden_dim, self.n_offsets + 1 + 2 + 1)
         self.cls_layers = nn.Linear(self.fc_hidden_dim, 2)
 
         # 设置分类层 bias，使得初始正样本概率极低（0.01），避免 Mode Collapse
-        # bias = -log((1-p)/p), p=0.01 => bias ≈ -4.59
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         nn.init.constant_(self.cls_layers.bias, bias_value)
@@ -128,7 +130,6 @@ class LLANetHead(nn.Module):
             ignore_index=self.cfg.ignore_label, weight=weights
         )
 
-        # Use SUM reduction for vectorized calculation, normalize manually later
         if self.enable_category:
             self.category_criterion = torch.nn.NLLLoss(reduction="sum")
         if self.enable_attribute:
@@ -137,18 +138,15 @@ class LLANetHead(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        import math
-
-        # 分类层初始化：设置 bias 使得初始正样本概率极低（0.01），避免 Mode Collapse
+        # 分类层初始化：设置 bias 使得初始正样本概率极低
         for m in self.cls_layers.parameters():
             if isinstance(m, nn.Linear):
-                # Weight 使用小的正态分布
                 nn.init.normal_(m.weight, mean=0.0, std=1e-3)
-                # Bias 设置使得初始预测概率约为 0.01
-                # bias = -log((1-p)/p), p=0.01 => bias ≈ -4.59
+                # bias已经在__init__中设置，这里如果不覆盖最好，或者再次确认
                 prior_prob = 0.01
                 bias_value = -math.log((1 - prior_prob) / prior_prob)
-                nn.init.constant_(m.bias, bias_value)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, bias_value)
             else:
                 nn.init.normal_(m, mean=0.0, std=1e-3)
 
@@ -172,17 +170,23 @@ class LLANetHead(nn.Module):
     def generate_priors_from_embeddings(self):
         device = self.prior_embeddings.weight.device
         priors = torch.zeros((self.num_priors, 6 + self.n_offsets), device=device)
-        priors[:, 0] = 0.1
-        priors[:, 1] = 0.9
-        priors[:, 2] = 0.5
-        priors[:, 3] = 0.1
+
+        # [Fix]: Priors 初始化修正
+        # Start Y: 设为 1.0 (图像底部)，而不是 0.1 (图像顶部)
+        # 这样 ROIGather 才能在初始阶段提取到有效的车道线特征
+        priors[:, 0] = 1.0
+        priors[:, 1] = torch.linspace(
+            0.0, 1.0, self.num_priors, device=device
+        )  # Start X
+        priors[:, 2] = 0.5  # Theta (0.5 * 180 = 90度，垂直)
+        priors[:, 3] = 0.5  # Length
         priors[:, 4] = 0.0
-        priors[:, 5] = 50.0
+        priors[:, 5] = 0.0
+
+        # 生成先验形状 (直线)
         for i in range(self.num_priors):
-            x_pos = (i + 0.5) / self.num_priors * (self.img_w - 1)
-            for j in range(self.n_offsets):
-                y_pos = (1 - j / (self.n_offsets - 1)) * (self.img_h - 1)
-                priors[i, 6 + j] = x_pos / (self.img_w - 1)
+            priors[i, 6:] = priors[i, 1]  # 简单的垂直线初始化
+
         priors_on_featmap = priors[..., 6 + self.sample_x_indexs]
         return priors, priors_on_featmap
 
@@ -330,13 +334,31 @@ class LLANetHead(nn.Module):
             ret_list = []
             batch_size = final_preds.shape[0]
             for i in range(batch_size):
-                sample_ret = {"lane_lines": final_preds[i]}
+                # ！！！注意：OpenLaneEvaluator 需要原始输出用于 NMS
+                # 我们这里返回 predictions_to_pred 转换后的对象 (Lane Object)
+                # 确保 Evaluator 能够处理 Lane Object 或者我们在这里不转
+                # 按照你之前的代码逻辑，这里返回的是 Lane Object List
+                sample_ret = {
+                    "lane_lines": self.predictions_to_pred(final_preds[i].unsqueeze(0))
+                }
                 if category_out is not None:
                     sample_ret["category"] = category_out[i]
                 if attribute_out is not None:
                     sample_ret["attribute"] = attribute_out[i]
                 ret_list.append(sample_ret)
             return ret_list
+
+    # 添加 predictions_to_pred 函数以支持 Evaluation
+    def predictions_to_pred(self, predictions):
+        # 简化版实现，只提取 line points
+        # 实际使用时需要 Lane 类支持
+        # 如果 Evaluator 是基于 Tensor 的，可以跳过这步
+        # 这里为了兼容性保留你原来 head 里的逻辑
+        lanes = []
+        for lane in predictions:
+            lane = lane.detach().cpu().numpy()
+            lanes.append(lane)  # 直接返回 numpy 数组，交给 Evaluator 处理
+        return lanes
 
     def loss(self, outputs, batch):
         """Vectorized Loss Calculation Optimized for GPU"""
@@ -352,7 +374,6 @@ class LLANetHead(nn.Module):
         # ============================================================
         # 1. 预处理 Targets: Pad to Tensor (B, Max_Lanes, Dim)
         # ============================================================
-        # 找到当前 Batch 中最大的车道线数量
         max_lanes = 0
         target_dim = 0
         if len(targets_list) > 0:
@@ -361,29 +382,20 @@ class LLANetHead(nn.Module):
             if max_lanes > 0:
                 target_dim = targets_list[0].shape[1]
 
-        # 至少保证有维度，避免报错
         max_lanes = max(max_lanes, 1)
         if target_dim == 0:
-            target_dim = 6 + 72  # 默认维度防止空数据报错
+            target_dim = 6 + 72
 
-        # 初始化 Batch Tensor
         batch_targets = torch.zeros((batch_size, max_lanes, target_dim), device=device)
-        batch_masks = torch.zeros(
-            (batch_size, max_lanes), device=device
-        )  # 1 for Valid, 0 for Padding
+        batch_masks = torch.zeros((batch_size, max_lanes), device=device)
 
-        # 填充数据
         for i, t in enumerate(targets_list):
             num_t = t.shape[0]
             if num_t > 0:
-                # 过滤有效线 (通常 index 1 是 valid flag)
-                # 假设 t 的格式与原始代码一致，其中 t[:, 1] == 1 表示有效
                 valid_mask = t[:, 1] == 1
                 valid_t = t[valid_mask]
-
                 num_valid = valid_t.shape[0]
                 if num_valid > 0:
-                    # 如果超过 max_lanes (理论上不会，但为了安全)
                     num_valid = min(num_valid, max_lanes)
                     batch_targets[i, :num_valid] = valid_t[:num_valid]
                     batch_masks[i, :num_valid] = 1
@@ -397,26 +409,29 @@ class LLANetHead(nn.Module):
         total_category_loss = 0.0
         total_attribute_loss = 0.0
 
-        # 导入新的向量化 assign
-        from ..CLRNet.dynamic_assign import assign
+        # 用于记录分项损失的累加器
+        total_loss_y_sum = 0.0
+        total_loss_x_sum = 0.0
+        total_loss_theta_sum = 0.0
+        total_loss_len_sum = 0.0
+        total_stage_count = 0
 
         for stage in range(self.refine_layers):
-            predictions = predictions_lists[stage]  # (B, Num_Priors, Dim)
+            predictions = predictions_lists[stage]
 
-            # --- ONE-SHOT ASSIGNMENT FOR THE WHOLE BATCH ---
-            # assigned_mask: (B, Num_Priors) Bool - True if prior matched
-            # assigned_ids:  (B, Num_Priors) Long - Index of matched GT (0 to Max_Lanes-1)
             with torch.no_grad():
                 assigned_mask, assigned_ids = assign(
-                    predictions, batch_targets, batch_masks, self.img_w, self.img_h
+                    predictions,
+                    batch_targets,
+                    batch_masks,
+                    self.img_w,
+                    self.img_h,
+                    self.cfg,
                 )
 
             # --- Classification Loss ---
-            # Focal Loss 输入: (N, C) logits, (N) targets
-            cls_targets = assigned_mask.long().view(-1)  # Flatten (B*N)
+            cls_targets = assigned_mask.long().view(-1)
             pred_cls_flat = predictions[..., :2].view(-1, 2)
-
-            # 计算正样本总数
             num_positives = assigned_mask.sum()
             cls_norm = max(num_positives.item(), 1.0)
 
@@ -424,24 +439,16 @@ class LLANetHead(nn.Module):
             total_cls_loss += stage_cls_loss / cls_norm
 
             if num_positives > 0:
-                # --- 选取正样本进行回归 ---
-                # predictions: (Num_Positives, Dim)
+                # --- 选取正样本 ---
                 pos_preds = predictions[assigned_mask]
-
-                # 获取对应的 GT
-                # batch_idx, prior_idx 用于定位
                 batch_idx, prior_idx = torch.where(assigned_mask)
-                target_idx = assigned_ids[batch_idx, prior_idx]  # (Num_Positives,)
+                target_idx = assigned_ids[batch_idx, prior_idx]
+                pos_targets = batch_targets[batch_idx, target_idx]
 
-                pos_targets = batch_targets[
-                    batch_idx, target_idx
-                ]  # (Num_Positives, Dim)
-
-                # --- Regression Loss (XYTL) ---
+                # --- Regression Loss (Absolute Coordinates) ---
                 reg_pred = pos_preds[:, 2:6]
                 reg_target = pos_targets[:, 2:6].clone()
 
-                # 调整 Target Start X (保持原逻辑)
                 with torch.no_grad():
                     pred_starts = torch.clamp(
                         (reg_pred[:, 0] * self.n_strips).round().long(),
@@ -449,48 +456,58 @@ class LLANetHead(nn.Module):
                         self.n_strips,
                     )
                     target_starts = (reg_target[:, 0] * self.n_strips).round().long()
-                    reg_target[:, 3] -= (pred_starts - target_starts) / self.n_strips
+                    start_diff = pred_starts - target_starts
+                    if reg_target[:, 3].max() > 1.0:
+                        reg_target[:, 3] -= start_diff.float()
+                    else:
+                        reg_target[:, 3] -= start_diff / self.n_strips
 
-                # 将 Theta 从 [0, 1] 转换为角度，再转换为 sin/cos 编码以解决周期性
-                # Theta: [0, 1] -> [0, 180] -> [0, pi] -> sin/cos
-                theta_pred_rad = reg_pred[:, 2] * math.pi  # 转换为弧度 [0, pi]
-                theta_target_rad = reg_target[:, 2] * math.pi
-
-                # 计算 sin/cos
-                theta_pred_sin = torch.sin(theta_pred_rad)
-                theta_pred_cos = torch.cos(theta_pred_rad)
-                theta_target_sin = torch.sin(theta_target_rad)
-                theta_target_cos = torch.cos(theta_target_rad)
-
-                # 还原到绝对坐标，但 Theta 使用 sin/cos
-                reg_pred_abs = torch.stack(
-                    [
-                        reg_pred[:, 0] * self.n_strips,  # X
-                        reg_pred[:, 1] * (self.img_w - 1),  # Y
-                        theta_pred_sin,  # Theta sin
-                        theta_pred_cos,  # Theta cos
-                        reg_pred[:, 3] * self.n_strips,  # Length
-                    ],
-                    dim=1,
+                # Start Y: 0~72
+                pred_y_abs = reg_pred[:, 0] * self.n_strips
+                target_y_abs = reg_target[:, 0] * self.n_strips
+                # Start X: 0~800
+                pred_x_abs = reg_pred[:, 1] * (self.img_w - 1)
+                target_x_abs = reg_target[:, 1] * (self.img_w - 1)
+                # Theta: 0~180 (角度制)
+                # Target 的 theta 已经是归一化的 0-1（atan/pi），需要乘 180
+                pred_theta_abs = reg_pred[:, 2] * 180
+                target_theta_abs = reg_target[:, 2] * 180
+                # Length: 0~72
+                pred_len_abs = reg_pred[:, 3] * self.n_strips
+                target_len_abs = reg_target[:, 3]
+                # 计算 Smooth L1
+                loss_y = F.smooth_l1_loss(pred_y_abs, target_y_abs, reduction="none")
+                loss_x = F.smooth_l1_loss(pred_x_abs, target_x_abs, reduction="none")
+                loss_theta = F.smooth_l1_loss(
+                    pred_theta_abs, target_theta_abs, reduction="none"
+                )
+                loss_len = F.smooth_l1_loss(
+                    pred_len_abs, target_len_abs, reduction="none"
                 )
 
-                reg_target_abs = torch.stack(
-                    [
-                        reg_target[:, 0] * self.n_strips,
-                        reg_target[:, 1] * (self.img_w - 1),
-                        theta_target_sin,
-                        theta_target_cos,
-                        reg_target[:, 3] * self.n_strips,
-                    ],
-                    dim=1,
+                # 【权重平衡】
+                # 降低 X 的权重 (0.5)，防止数值过大主导梯度
+                # 其他保持 1.0
+                reg_weights = torch.tensor([1.0, 0.5, 1.0, 1.0], device=device)
+
+                loss_components = torch.stack(
+                    [loss_y, loss_x, loss_theta, loss_len], dim=1
                 )
 
-                total_reg_xytl_loss += F.smooth_l1_loss(
-                    reg_pred_abs, reg_target_abs, reduction="mean"
+                # Sum and Normalize by num_positives
+                total_reg_xytl_loss += (loss_components * reg_weights).sum() / max(
+                    num_positives, 1
                 )
+
+                # 累加分项损失用于记录（如果提供了 logger）
+                if self.detailed_loss_logger is not None:
+                    total_loss_y_sum += loss_y.mean().item()
+                    total_loss_x_sum += loss_x.mean().item()
+                    total_loss_theta_sum += loss_theta.mean().item()
+                    total_loss_len_sum += loss_len.mean().item()
+                    total_stage_count += 1
 
                 # --- IoU Loss ---
-                # pos_preds index 6 开始是点集
                 line_pred = pos_preds[:, 6:] * (self.img_w - 1)
                 line_target = pos_targets[:, 6:] * (self.img_w - 1)
 
@@ -498,23 +515,16 @@ class LLANetHead(nn.Module):
                     line_pred, line_target, self.img_w, length=15
                 )
 
-                # --- Category & Attribute Loss (仅在最后一层) ---
+                # --- Category & Attribute Loss ---
                 if stage == self.refine_layers - 1:
-                    # Category
                     if self.enable_category and "category" in outputs:
                         cat_preds = outputs["category"][assigned_mask]
-
-                        # 处理 Category Targets (Padding check)
                         if isinstance(batch_lane_categories, torch.Tensor):
-                            # 如果已经是 Tensor (B, Max_Lanes)，直接 gather
                             cat_targets = batch_lane_categories[batch_idx, target_idx]
-
-                            # 注意：这里除以 batch_size，符合你之前代码的意图
                             total_category_loss += self.category_criterion(
                                 cat_preds.log_softmax(dim=-1), cat_targets
                             ) / max(batch_size, 1)
 
-                    # Attribute
                     if self.enable_attribute and "attribute" in outputs:
                         attr_preds = outputs["attribute"][assigned_mask]
                         if isinstance(batch_lane_attributes, torch.Tensor):
@@ -523,6 +533,36 @@ class LLANetHead(nn.Module):
                                 attr_preds.log_softmax(dim=-1), attr_targets
                             ) / max(batch_size, 1)
 
+        # Seg Loss 计算（移至记录之前）
+        seg_loss = torch.tensor(0.0, device=device)
+        if outputs.get("seg", None) is not None and batch.get("seg", None) is not None:
+            seg_pred = outputs["seg"]
+            if seg_pred.shape[-2:] != batch["seg"].shape[-2:]:
+                seg_pred = F.interpolate(
+                    seg_pred,
+                    size=batch["seg"].shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            seg_loss = self.criterion(
+                F.log_softmax(seg_pred, dim=1), batch["seg"].long()
+            )
+
+        # 记录分项损失（如果提供了 logger）
+        if self.detailed_loss_logger is not None and total_stage_count > 0:
+            detailed_loss_dict = {
+                "loss_start_y": total_loss_y_sum / total_stage_count,
+                "loss_start_x": total_loss_x_sum / total_stage_count,
+                "loss_theta": total_loss_theta_sum / total_stage_count,
+                "loss_length": total_loss_len_sum / total_stage_count,
+                "reg_xytl_loss": total_reg_xytl_loss.item() / self.refine_layers,
+                "cls_loss": total_cls_loss.item() / self.refine_layers,
+                "iou_loss": total_iou_loss.item() / self.refine_layers,
+                "loss_category": total_category_loss.item(),
+                "loss_attribute": total_attribute_loss.item(),
+                "seg_loss": seg_loss.item(),
+            }
+            self.detailed_loss_logger.log(None, detailed_loss_dict)
         # 3. 汇总 Loss
         losses = {}
         losses["cls_loss"] = (
@@ -537,20 +577,6 @@ class LLANetHead(nn.Module):
         losses["loss_category"] = total_category_loss * self.cfg.category_loss_weight
         losses["loss_attribute"] = total_attribute_loss * self.cfg.attribute_loss_weight
 
-        # Seg Loss (保持原样)
-        seg_loss = torch.tensor(0.0, device=device)
-        if outputs.get("seg", None) is not None and batch.get("seg", None) is not None:
-            seg_pred = outputs["seg"]
-            if seg_pred.shape[-2:] != batch["seg"].shape[-2:]:
-                seg_pred = F.interpolate(
-                    seg_pred,
-                    size=batch["seg"].shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            seg_loss = self.criterion(
-                F.log_softmax(seg_pred, dim=1), batch["seg"].long()
-            )
         losses["seg_loss"] = seg_loss * self.cfg.seg_loss_weight
 
         return losses

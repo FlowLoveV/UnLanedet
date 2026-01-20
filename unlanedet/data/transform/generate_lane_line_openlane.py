@@ -4,9 +4,6 @@ import math
 import imgaug.augmenters as iaa
 import cv2
 
-# === 【核心优化】强制关闭 OpenCV 多线程 ===
-# 在 DataLoader 多进程模式下，OpenCV 的多线程会导致严重的 CPU 争抢和上下文切换
-# 设置为 0 表示只使用当前线程，这是多进程数据加载的最佳实践
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 # =======================================
@@ -117,9 +114,56 @@ class GenerateLaneLineOpenLane(object):
         return xs_outside_image, xs_inside_image
 
     def transform_annotation(self, anno, img_wh):
+        """
+        将原始标注转换为网络训练所需的 lane_line 格式
+
+        ===================================================
+        输入 anno["lanes"] 格式:
+        - list of lists, 每个 lane 包含多个 (x, y) 坐标点
+        - 坐标是图像像素坐标 (绝对坐标)
+        - 例如: lanes = [[(100, 200), (150, 250), (200, 300)], ...]
+
+        ===================================================
+        输出 lanes 张量格式 (shape: [max_lanes, 6 + n_offsets]):
+        - max_lanes: 最大车道线数量 (24)
+        - n_offsets: 采样点数量 (72)
+
+        各列含义:
+        ---------------------------------------------------
+        列索引 | 字段名称           | 形状说明                | 数值范围       | 单位/归一化
+        -------|-------------------|------------------------|--------------|-----------
+        0      | ignore_flag       | 是否忽略该车道线         | 0/1          | - (0=有效, 1=忽略)
+        1      | is_lane           | 是否为车道线             | 0/1          | - (0=是车道线, 1=背景)
+        2      | start_y           | 车道线起始 Y 坐标        | [0, 1]        | 归一化 (strip 索引 / n_strips)
+        3      | start_x           | 车道线起始 X 坐标        | [0, 1]        | 归一化 (像素 / img_w)
+        4      | theta             | 车道线平均角度           | [0, 1]        | 归一化 (角度/π)
+        5      | length            | 车道线长度               | [0, 1]        | 归一化 (strip 数量 / n_strips)
+        6+     | xs[0:n_offsets]  | 沿 Y 轴采样的 X 坐标序列  | [0, 1]        | 归一化 (像素 / img_w)
+        ---------------------------------------------------
+
+        关键说明:
+        1. start_y, start_x, theta, xs 都是归一化值 [0, 1]
+        2. length 是绝对值 (strip 数量)，范围 [1, 72]，未归一化！
+        3. xs 序列从下到上按固定 Y 间隔采样，共 72 个点
+
+        ===================================================
+        输出 lane_endpoints 张量格式 (shape: [max_lanes, 2]):
+        各列含义:
+        ---------------------------------------------------
+        列索引 | 字段名称           | 数值范围       | 单位/归一化
+        -------|-------------------|--------------|-----------
+        0      | endpoint_y        | [0, 1]        | 归一化 (strip 索引 / n_strips)
+        1      | endpoint_x        | [0, 1]        | 归一化 (像素 / img_w)
+        ---------------------------------------------------
+        """
         old_lanes = anno["lanes"]
+        # 过滤掉点数 <= 1 的车道线
         old_lanes = filter(lambda x: len(x) > 1, old_lanes)
+        # 按 Y 坐标从下到上排序 (bottom to top)
         old_lanes = [sorted(lane, key=lambda x: -x[1]) for lane in old_lanes]
+
+        # 初始化 lanes 张量 (填充 -1e5 作为默认无效值)
+        # shape: [max_lanes, 6 + n_offsets]
         lanes = (
             np.ones(
                 (self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32
@@ -127,27 +171,44 @@ class GenerateLaneLineOpenLane(object):
             * -1e5
         )
         lanes_endpoints = np.ones((self.max_lanes, 2))
+        # 默认: 忽略所有车道线 (ignore_flag=1)
         lanes[:, 0] = 1
+        # 默认: 标记为背景 (is_lane=1, 0 表示车道线)
         lanes[:, 1] = 0
 
         for lane_idx, lane in enumerate(old_lanes):
             if lane_idx >= self.max_lanes:
                 break
+
+            # 从稀疏标注点采样固定 Y 位置的 X 坐标
             try:
                 xs_outside_image, xs_inside_image = self.sample_lane(
                     lane, self.offsets_ys
                 )
             except Exception:
                 continue
+
             if len(xs_inside_image) <= 1:
                 continue
 
+            # 合并图像内外的所有采样点
             all_xs = np.hstack((xs_outside_image, xs_inside_image))
+
+            # 标记该车道线有效 (ignore_flag=0, is_lane=1)
             lanes[lane_idx, 0] = 0
             lanes[lane_idx, 1] = 1
+
+            # 列 2: start_y - 车道线起始 Y 坐标 (strip 索引 / n_strips, 归一化到 [0,1])
+            # 例如: 图像外有 5 个点, n_strips=71, 则 start_y = 5/71 ≈ 0.07
             lanes[lane_idx, 2] = len(xs_outside_image) / self.n_strips
+
+            # 列 3: start_x - 车道线起始 X 坐标 (像素 / img_w, 归一化到 [0,1])
+            # 例如: start_x = 100 / 800 = 0.125
             lanes[lane_idx, 3] = xs_inside_image[0] / self.img_w
 
+            # 列 4: theta - 车道线平均角度 (归一化到 [0,1], 公式: 角度 / π)
+            # 计算方法: 使用 atan(垂直距离 / 水平距离) / π
+            # 注意: 这里的角度计算是从起始点到采样点的平均斜率
             thetas = []
             for i in range(1, len(xs_inside_image)):
                 theta = (
@@ -158,13 +219,22 @@ class GenerateLaneLineOpenLane(object):
                     )
                     / math.pi
                 )
+                # 将角度映射到 [0, 1] 范围 (处理负角度)
                 theta = theta if theta > 0 else 1 - abs(theta)
                 thetas.append(theta)
             theta_far = sum(thetas) / len(thetas) if thetas else 0.0
-
             lanes[lane_idx, 4] = theta_far
-            lanes[lane_idx, 5] = len(xs_inside_image)
+
+            # 列 5: length - 车道线长度 (归一化到 [0,1], strip 数量 / n_strips)
+            lanes[lane_idx, 5] = len(xs_inside_image) / self.n_strips
+
+            # 列 6+: xs[0:n_offsets] - 采样点 X 坐标序列 (像素 / img_w, 归一化到 [0,1])
+            # 共 72 个点, 从下到上按固定 Y 间隔采样
             lanes[lane_idx, 6 : 6 + len(all_xs)] = all_xs / self.img_w
+
+            # lane_endpoints: 车道线终点坐标 (用于训练)
+            # endpoint_y: (strip 索引 / n_strips, 归一化到 [0,1])
+            # endpoint_x: (像素 / img_w, 归一化到 [0,1])
             lanes_endpoints[lane_idx, 0] = (len(all_xs) - 1) / self.n_strips
             lanes_endpoints[lane_idx, 1] = xs_inside_image[-1] / self.img_w
 

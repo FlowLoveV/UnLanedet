@@ -14,17 +14,19 @@ from unlanedet.model.LLANet.gsa_fpn import GSAFPN
 from unlanedet.model.LLANet.llanet import LLANet
 
 
-def create_llanet_model(cfg):
+def create_llanet_model(cfg, detailed_loss_logger=None):
     """
     创建独立的LLANet模型实例
 
     Args:
         cfg: 配置参数
+        detailed_loss_logger: 可选的分项损失记录器，用于记录 XYTL 分项损失
+                             如果为None且cfg有output_dir属性，则自动创建logger
 
     Returns:
         模型配置
     """
-    # 生成唯一随机种子确保独立性
+    # 1. 种子设置 (保持不变)
     seed = random.randint(1000, 9999)
     random.seed(seed)
     np.random.seed(seed)
@@ -32,20 +34,35 @@ def create_llanet_model(cfg):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # 决定是否使用 ImageNet 预训练
-    use_pretrained = getattr(cfg, "use_pretrained_backbone", True)  # 默认使用预训练
+    # 2. 决定是否使用 ImageNet 预训练
+    use_pretrained = getattr(cfg, "use_pretrained_backbone", True)
 
-    # 创建模型 - 使用 timm 的 MobileNetV4
+    # 3. Logger 设置 (保持不变)
+    if detailed_loss_logger is None and hasattr(cfg, "output_dir"):
+        from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
+
+        detailed_loss_logger = DetailedLossLogger(
+            output_dir=cfg.output_dir, filename="detailed_metrics.json"
+        )
+
+    # 读取特征图输出通道数 (Neck的输出，Head的输入)
+    feature_dim = getattr(cfg, "featuremap_out_channel", 64)
+    cfg.featuremap_out_channel = feature_dim
+
+    # 读取全连接层隐藏层维度 (Head 内部)
+    hidden_dim = getattr(cfg, "fc_hidden_dim", feature_dim)
+
+    # 创建模型
     model = L(LLANet)(
         backbone=L(TimmMobileNetV4Wrapper)(
-            model_name="mobilenetv4_conv_small.e2400_r224_in1k",
+            model_name="mobilenetv4_conv_medium",
             pretrained=use_pretrained,
             features_only=True,
-            out_indices=[2, 3, 4],  # 输出 stride 8, 16, 32 的特征
+            out_indices=[2, 3, 4],
         ),
         neck=L(GSAFPN)(
-            in_channels=[64, 96, 960],  # timm mobilenetv4_conv_small 的输出通道
-            out_channels=64,
+            in_channels=[80, 160, 960],
+            out_channels=feature_dim,
             num_outs=3,
             scm_kernel_size=3,
             enable_global_semantic=True,
@@ -53,11 +70,13 @@ def create_llanet_model(cfg):
         head=L(LLANetHead)(
             num_priors=cfg.num_priors,
             refine_layers=3,
-            fc_hidden_dim=64,
+            prior_feat_channels=feature_dim,
+            fc_hidden_dim=hidden_dim,
             sample_points=36,
             cfg=cfg,
             enable_category=True,
             enable_attribute=True,
+            detailed_loss_logger=detailed_loss_logger,
         ),
     )
 

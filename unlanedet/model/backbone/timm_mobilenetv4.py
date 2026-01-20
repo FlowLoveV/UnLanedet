@@ -5,12 +5,15 @@ Timm MobileNetV4 Backbone Wrapper
 import torch
 import torch.nn as nn
 import timm
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class TimmMobileNetV4Wrapper(nn.Module):
     """timm MobileNetV4 wrapper to match our interface."""
 
-    def __init__(self, model_name='mobilenetv4_conv_small.e2400_r224_in1k',
+    def __init__(self, model_name='mobilenetv4_conv_medium',
                  pretrained=True, features_only=True, out_indices=[2, 3, 4]):
         super().__init__()
         self.model = timm.create_model(
@@ -22,8 +25,9 @@ class TimmMobileNetV4Wrapper(nn.Module):
 
         # 获取输出通道数
         self.out_channels = self.model.feature_info.channels()
-        print(f"[TimmMobileNetV4] Using {model_name}, pretrained={pretrained}")
-        print(f"[TimmMobileNetV4] Output channels: {self.out_channels}")
+        logger.info(f"[TimmMobileNetV4] Using {model_name}, pretrained={pretrained}")
+        logger.info(f"[TimmMobileNetV4] Output channels: {self.out_channels}")
+        logger.info(f"[TimmMobileNetV4] Actual model class: {type(self.model).__name__}")
 
     def forward(self, x):
         return self.model(x)
