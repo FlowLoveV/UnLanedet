@@ -37,7 +37,7 @@ featuremap_out_channel = 192
 num_classes = 4 + 1
 # 请确保CULane数据集已下载并解压到此路径
 # 默认路径为相对路径，指向项目中的data目录
-data_root = "/home/data/CULane"
+data_root = "/data0/lxy_data/mslanedet/CULane/"
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight
@@ -89,6 +89,7 @@ total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period=epoch_per_iter
 train.eval_period = epoch_per_iter
+train.output_dir = "output/culane/clrnet_resnet34"
 
 optimizer = get_config("config/common/optim.py").AdamW
 optimizer.lr = 0.6e-3

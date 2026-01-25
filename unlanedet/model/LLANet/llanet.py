@@ -21,6 +21,12 @@ class LLANet(nn.Module):
 
     def forward(self, data):
         img = data["img"]  # Extract image tensor from data dict
+
+        # Ensure image is on the same device as the model
+        device = next(self.backbone.parameters()).device
+        if img.device != device:
+            img = img.to(device)
+
         features = self.backbone(img)
         neck_features = self.neck(features)
 

@@ -40,11 +40,11 @@ from fvcore.common.param_scheduler import (
 from ..modelzoo import get_config
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
 from .model_factory import create_llanet_model
-
+from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
 
 iou_loss_weight = 2.0
 cls_loss_weight = 2.0
-xyt_loss_weight = 0.1
+xyt_loss_weight = 0.2
 seg_loss_weight = 1.0
 category_loss_weight = 1.0
 attribute_loss_weight = 0.5
@@ -85,12 +85,14 @@ num_classes = 4 + 1
 data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/"  # openlane 数据集根目录
 lane_anno_dir = "lane3d_300/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
 opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
+dataset_statistics = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"
 
 use_preprocessed = True  #  是否采取预处理方式
 enable_3d = False  #  是否读取3D数据
 
 param_config = OmegaConf.create()
 param_config.opencv_path = opencv_path
+param_config.dataset_statistics = dataset_statistics
 param_config.use_preprocessed = use_preprocessed
 param_config.enable_3d = enable_3d
 param_config.use_pretrained_backbone = True
@@ -139,13 +141,20 @@ train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter * 16
 train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
-param_config.output_dir = train.output_dir
 
 # Model Config
 param_config.featuremap_out_channel = 64  # neck 层输出通道数目
 param_config.fc_hidden_dim = 64  # head层 全连接层隐藏层维度
-param_config.epoch_per_iter = epoch_per_iter
-param_config.assign_method = "CLRNet"  # optional GeometryAware
+param_config.output_dir = train.output_dir  # 输出目录，用于保存模型和日志
+param_config.epoch_per_iter = epoch_per_iter  # 每个epoch的迭代次数
+param_config.assign_method = "CLRNet"  # assign方法，可选 GeometryAware or CLRNet
+param_config.pretrained_model_name = "mobilenetv4_conv_medium"  # 预训练模型名称
+param_config.enable_category = True
+param_config.enable_attribute = True
+param_config.scale_factor = 20.0
+param_config.detailed_loss_logger_config = dict(
+    output_dir=param_config.output_dir, filename="detailed_metrics.json"
+)
 model = create_llanet_model(param_config)
 
 # Optimizer Config

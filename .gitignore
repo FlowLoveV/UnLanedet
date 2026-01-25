@@ -164,6 +164,9 @@ cython_debug/
 output
 assets
 monitor_logs
+debug_vis
+source
+.trae
 
 # extra ide
 .codebuddy 

@@ -14,7 +14,7 @@ from unlanedet.model.LLANet.gsa_fpn import GSAFPN
 from unlanedet.model.LLANet.llanet import LLANet
 
 
-def create_llanet_model(cfg, detailed_loss_logger=None):
+def create_llanet_model(cfg):
     """
     创建独立的LLANet模型实例
 
@@ -26,6 +26,8 @@ def create_llanet_model(cfg, detailed_loss_logger=None):
     Returns:
         模型配置
     """
+    if cfg is None:
+        raise ValueError("cfg 不能为空")
     # 1. 种子设置 (保持不变)
     seed = random.randint(1000, 9999)
     random.seed(seed)
@@ -35,27 +37,14 @@ def create_llanet_model(cfg, detailed_loss_logger=None):
         torch.cuda.manual_seed_all(seed)
 
     # 2. 决定是否使用 ImageNet 预训练
-    use_pretrained = getattr(cfg, "use_pretrained_backbone", True)
+    use_pretrained = cfg.get("use_pretrained_backbone", True)
+    pretrained_model_name = cfg.get("pretrained_model_name", "mobilenetv4_conv_medium")
+    feature_dim = cfg.get("featuremap_out_channel", 64)
+    hidden_dim = cfg.get("fc_hidden_dim", feature_dim)
 
-    # 3. Logger 设置 (保持不变)
-    if detailed_loss_logger is None and hasattr(cfg, "output_dir"):
-        from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
-
-        detailed_loss_logger = DetailedLossLogger(
-            output_dir=cfg.output_dir, filename="detailed_metrics.json"
-        )
-
-    # 读取特征图输出通道数 (Neck的输出，Head的输入)
-    feature_dim = getattr(cfg, "featuremap_out_channel", 64)
-    cfg.featuremap_out_channel = feature_dim
-
-    # 读取全连接层隐藏层维度 (Head 内部)
-    hidden_dim = getattr(cfg, "fc_hidden_dim", feature_dim)
-
-    # 创建模型
     model = L(LLANet)(
         backbone=L(TimmMobileNetV4Wrapper)(
-            model_name="mobilenetv4_conv_medium",
+            model_name=pretrained_model_name,
             pretrained=use_pretrained,
             features_only=True,
             out_indices=[2, 3, 4],
@@ -74,10 +63,6 @@ def create_llanet_model(cfg, detailed_loss_logger=None):
             fc_hidden_dim=hidden_dim,
             sample_points=36,
             cfg=cfg,
-            enable_category=True,
-            enable_attribute=True,
-            detailed_loss_logger=detailed_loss_logger,
         ),
     )
-
     return model

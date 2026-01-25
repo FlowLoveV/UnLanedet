@@ -2,37 +2,76 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ...layers import Conv2d, get_norm, Activation as _BaseActivation
 
 
-# Mock imports to avoid relative import issues
-class Conv2d(nn.Conv2d):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        stride=1,
-        padding=0,
-        norm=None,
-        activation=None,
-        **kwargs
-    ):
-        super().__init__(
-            in_channels, out_channels, kernel_size, stride, padding, **kwargs
-        )
+class Activation(nn.Module):
+    """
+    兼容型 Activation：
+    - act_cfg 可为 None / str / dict / nn.Module / callable
+    - 支持 relu、leaky_relu、sigmoid、tanh 等常见写法
+    - 不改变外部接口（仍然用 Activation(act=act_cfg) 的调用方式）
+    """
 
+    _ALIASES = {
+        "leaky_relu": "leakyrelu",
+        "relu6": "relu6",
+        "hard_sigmoid": "hsigmoid",
+        "hardsigmoid": "hsigmoid",
+        "hard_swish": "hardswish",
+        "hardswish": "hardswish",
+    }
 
-class BatchNorm2d(nn.BatchNorm2d):
-    pass
-
-
-def get_norm(norm_cfg, num_features):
-    return BatchNorm2d(num_features)
-
-
-class Activation:
     def __init__(self, act=None):
-        self.act = nn.ReLU(inplace=True) if act is None else nn.ReLU(inplace=True)
+        super().__init__()
+        self._cfg = act
+        self.act_func = None
+
+        if act is None:
+            return
+
+        # nn.Module / callable
+        if isinstance(act, nn.Module):
+            self.act_func = act
+            return
+        if callable(act) and not isinstance(act, (str, dict)):
+            self.act_func = act
+            return
+
+        # dict config
+        if isinstance(act, dict):
+            # 兼容常见字段：type/name
+            name = act.get("type", act.get("name", None))
+            if name is None:
+                raise KeyError(f"Activation dict 缺少 type/name: {act}")
+            name = str(name).lower()
+            name = self._ALIASES.get(name, name)
+            if name == "leakyrelu":
+                negative_slope = float(act.get("negative_slope", 0.01))
+                self.act_func = nn.LeakyReLU(
+                    negative_slope=negative_slope, inplace=True
+                )
+                return
+            # 其他交给基础实现（支持大多数 nn.modules.activation）
+            self.act_func = _BaseActivation(act=name)
+            return
+
+        # str
+        if isinstance(act, str):
+            name = act.lower()
+            name = self._ALIASES.get(name, name)
+            if name == "leakyrelu":
+                self.act_func = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+                return
+            self.act_func = _BaseActivation(act=name)
+            return
+
+        raise TypeError(f"不支持的 act_cfg 类型: {type(act)} ({act})")
+
+    def forward(self, x):
+        if self.act_func is None:
+            return x
+        return self.act_func(x)
 
 
 class AsymmetricConv(nn.Module):
@@ -81,6 +120,9 @@ class SCModule(nn.Module):
         self, in_channels, out_channels, kernel_size=3, norm_cfg=None, act_cfg=None
     ):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self._norm_cfg = norm_cfg
 
         # 允许通道变换 (in_channels -> out_channels)
         self.asym_conv = AsymmetricConv(
@@ -91,15 +133,27 @@ class SCModule(nn.Module):
             act_cfg=act_cfg,
         )
 
+        # shortcut：
+        # - in_channels != out_channels: 1x1 conv (+ same norm_cfg) 做维度匹配
+        # - in_channels == out_channels: 若 norm_cfg 不为 None，仍包含 norm 以与主分支统计一致
+        self.shortcut = None
+        if in_channels != out_channels:
+            self.shortcut = Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                norm=get_norm(norm_cfg, out_channels) if norm_cfg else None,
+                activation=None,
+            )
+        elif norm_cfg is not None:
+            self.shortcut = get_norm(norm_cfg, out_channels)
+
         # 注意力权重生成 (att_weight 通道数需与 context_feat 一致)
         # 修改：移除内部 Sigmoid，并在 forward 中手动添加
         self.att_conv = Conv2d(
             out_channels, out_channels, kernel_size=1, activation=None
         )
-        # 初始化为 0，使得 Sigmoid 输出 0.5，特征初始时能流过
-        nn.init.constant_(self.att_conv.weight, 0)
-        if self.att_conv.bias is not None:
-            nn.init.constant_(self.att_conv.bias, 0)
+        # 改进注意力初始化：使用 Xavier 初始化（具体初始化策略在 GSAFPN.init_weights 中统一处理）
 
     def forward(self, x):
         # 非对称卷积提取条带上下文特征并投影维度
@@ -108,10 +162,14 @@ class SCModule(nn.Module):
 
         # 生成空间注意力权重
         att_weight = torch.sigmoid(self.att_conv(context_feat))
-        
-        # 修改：添加残差连接 (Residual Connection)
-        # 这样即使 Attention 没学好，主干特征也不会丢失
-        return context_feat + (context_feat * att_weight)
+
+        # 修复：使用输入 x 的残差连接（带维度匹配 shortcut）
+        residual = x if self.shortcut is None else self.shortcut(x)
+        att_out = context_feat * att_weight
+        assert (
+            residual.shape == att_out.shape
+        ), f"SCModule 维度不匹配: residual={tuple(residual.shape)} vs att_out={tuple(att_out.shape)}"
+        return residual + att_out
 
 
 class GSAFPN(nn.Module):
@@ -143,6 +201,7 @@ class GSAFPN(nn.Module):
         init_cfg=dict(type="Xavier", layer="Conv2d", distribution="uniform"),
         scm_kernel_size=3,
         enable_global_semantic=True,
+        debug=False,
     ):
         super(GSAFPN, self).__init__()
         self.in_channels = in_channels
@@ -154,6 +213,15 @@ class GSAFPN(nn.Module):
         self.no_norm_on_lateral = no_norm_on_lateral
         self.upsample_cfg = upsample_cfg.copy()
         self.enable_global_semantic = enable_global_semantic
+        self.debug = bool(debug)
+
+        # 完善上采样配置：对需要 align_corners 的插值模式补默认值
+        mode = self.upsample_cfg.get("mode", "nearest")
+        if (
+            mode in ("bilinear", "bicubic", "trilinear")
+            and "align_corners" not in self.upsample_cfg
+        ):
+            self.upsample_cfg["align_corners"] = False
 
         # 设置backbone结束层级
         if end_level == -1:
@@ -199,7 +267,7 @@ class GSAFPN(nn.Module):
                 3,
                 padding=1,
                 norm=get_norm(norm_cfg, out_channels),
-                activation=Activation(act=act_cfg),
+                activation=Activation(act=act_cfg) if act_cfg is not None else None,
             )
             self.fpn_convs.append(fpn_conv)
 
@@ -232,7 +300,7 @@ class GSAFPN(nn.Module):
                     stride=2,
                     padding=1,
                     norm=get_norm(norm_cfg, out_channels),
-                    activation=Activation(act=act_cfg),
+                    activation=Activation(act=act_cfg) if act_cfg is not None else None,
                 )
                 self.extra_fpn_convs.append(extra_fpn_conv)
 
@@ -241,12 +309,27 @@ class GSAFPN(nn.Module):
 
     def init_weights(self):
         """初始化权重"""
-        for m in self.modules():
+        # 改进权重初始化：
+        # - 普通卷积使用 kaiming_normal_
+        # - 注意力层（SCModule.att_conv）使用 xavier_uniform_
+        n_conv = 0
+        n_att = 0
+        for name, m in self.named_modules():
             if isinstance(m, nn.Conv2d):
-                if hasattr(m, "weight") and m.weight is not None:
-                    nn.init.xavier_uniform_(m.weight)
-                if hasattr(m, "bias") and m.bias is not None:
+                n_conv += 1
+                if getattr(m, "weight", None) is not None:
+                    if name.endswith("att_conv"):
+                        # 优化注意力层初始化：更小 std，避免 sigmoid 饱和
+                        nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                        n_att += 1
+                    else:
+                        nn.init.kaiming_normal_(
+                            m.weight, mode="fan_out", nonlinearity="relu"
+                        )
+                if getattr(m, "bias", None) is not None:
                     nn.init.constant_(m.bias, 0)
+        if self.debug:
+            print(f"[GSAFPN][init] conv_layers={n_conv}, att_conv_layers={n_att} (att std=0.01)")
 
     def forward(self, inputs):
         """前向传播
@@ -258,12 +341,21 @@ class GSAFPN(nn.Module):
         Returns:
             Tuple[Tensor]: 融合后的特征金字塔 [p3, p4, p5, ...]
         """
-        assert len(inputs) >= len(self.in_channels)
+        # 类型安全检查：支持 tuple/list
+        if not isinstance(inputs, (list, tuple)):
+            raise TypeError(f"inputs 必须为 list/tuple, got {type(inputs)}")
+        inputs = list(inputs)
 
-        # 如果输入多于预期，删除前面的特征图（通常是更低层级的特征）
-        if len(inputs) > len(self.in_channels):
-            for _ in range(len(inputs) - len(self.in_channels)):
-                del inputs[0]
+        # 改进输入裁剪逻辑：按 backbone_end_level 动态选择输入特征
+        assert len(inputs) >= self.backbone_end_level, (
+            f"inputs 数量不足: got {len(inputs)}, expect >= {self.backbone_end_level}"
+        )
+        if len(inputs) > self.backbone_end_level:
+            # 保留最后 backbone_end_level 个特征（通常对应更高层级）
+            inputs = inputs[-self.backbone_end_level :]
+        assert len(inputs) == self.backbone_end_level, (
+            f"裁剪后 inputs 数量不匹配: got {len(inputs)}, expect {self.backbone_end_level}"
+        )
 
         # ===== 1. SCM横向连接 =====
         laterals = [
@@ -280,27 +372,22 @@ class GSAFPN(nn.Module):
             # 将全局语义投影到特征空间
             semantic_feat = self.semantic_projection(global_semantic)  # [B, C, 1, 1]
 
-            # 广播到浅层特征的尺寸并相加（语义对齐）
-            # 注入到p4 (c4对应的特征图)
-            if len(laterals) >= 2:
-                semantic_p4 = F.interpolate(
-                    semantic_feat,
-                    size=laterals[-2].shape[2:],
-                    mode="bilinear",
-                    align_corners=False,
+            # 修正：根据 start_level 动态计算注入目标层级
+            # 语义注入到除最深层之外的所有更浅层（更鲁棒，适配不同 start_level/层数）
+            # 统一插值模式：使用 self.upsample_cfg（与 FPN 上采样一致）
+            # 注意：使用 size 时不能与 scale_factor 共存
+            up_cfg = dict(self.upsample_cfg)
+            up_cfg.pop("scale_factor", None)
+            for lvl in range(len(laterals) - 1):
+                semantic_lvl = F.interpolate(
+                    semantic_feat, size=laterals[lvl].shape[2:], **up_cfg
                 )
-                laterals[-2] = laterals[-2] + semantic_p4
-
-            # 注入到p3 (c3对应的特征图) - 增强鲁棒性检查
-            if len(laterals) >= 1:
-                target_idx = 0  # First lateral corresponds to p3/stride8
-                semantic_p3 = F.interpolate(
-                    semantic_feat,
-                    size=laterals[target_idx].shape[2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                laterals[target_idx] = laterals[target_idx] + semantic_p3
+                laterals[lvl] = laterals[lvl] + semantic_lvl
+        elif self.enable_global_semantic and self.debug:
+            # 边界情况：层数不足 3 时跳过
+            print(
+                f"[GSAFPN][debug] enable_global_semantic=True 但层数不足3，laterals={len(laterals)}，跳过语义注入"
+            )
 
         # ===== 3. 构建自上而下的路径 =====
         used_backbone_levels = len(laterals)
@@ -349,4 +436,21 @@ class GSAFPN(nn.Module):
                             self.extra_fpn_convs[i - used_backbone_levels](outs[-1])
                         )
 
+        assert (
+            len(outs) == self.num_outs
+        ), f"输出 outs 数量不匹配: got {len(outs)}, expect {self.num_outs}"
+
+        if self.debug:
+            with torch.no_grad():
+                for i, o in enumerate(outs):
+                    o_f = o.float()
+                    nan_cnt = int(torch.isnan(o_f).sum().item())
+                    inf_cnt = int(torch.isinf(o_f).sum().item())
+                    print(
+                        f"[GSAFPN][debug] out[{i}] shape={tuple(o.shape)} "
+                        f"dtype={o.dtype} device={o.device} requires_grad={o.requires_grad} "
+                        f"mean={o_f.mean().item():.4g} std={o_f.std(unbiased=False).item():.4g} "
+                        f"min={o_f.min().item():.4g} max={o_f.max().item():.4g} "
+                        f"nan={nan_cnt} inf={inf_cnt}"
+                    )
         return tuple(outs)

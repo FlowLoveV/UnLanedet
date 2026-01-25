@@ -1,3 +1,4 @@
+from calendar import c
 import math
 import torch
 import numpy as np
@@ -6,12 +7,15 @@ import torch.nn.functional as F
 import os
 import cv2
 import random
+import logging
 
 from ..module.head.plaindecoder import PlainDecoder
 from ..module.losses.focal_loss import FocalLoss
 from .line_iou import line_iou, liou_loss
 from .dynamic_assign import assign
 from .roi_gather import ROIGather, LinearModule
+from .prior import init_prior_embeddings_with_stats
+from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
 
 
 class LLANetHead(nn.Module):
@@ -25,24 +29,27 @@ class LLANetHead(nn.Module):
         refine_layers=3,
         sample_points=36,
         cfg=None,
-        enable_category=True,
-        enable_attribute=True,
-        num_lane_categories=15,
-        scale_factor=20.0,
-        detailed_loss_logger=None,
     ):
         super(LLANetHead, self).__init__()
+        if cfg is None:
+            raise ValueError("cfg must be provided")
         self.cfg = cfg
-        self.enable_category = enable_category
-        self.enable_attribute = enable_attribute
-        self.num_lane_categories = num_lane_categories
-        self.scale_factor = scale_factor
-        self.detailed_loss_logger = detailed_loss_logger
-
-        self.img_w = 800 if cfg is None else self.cfg.img_w
-        self.img_h = 320 if cfg is None else self.cfg.img_h
-        self.num_lr_attributes = 4 if cfg is None else self.cfg.num_lr_attributes
-
+        self.enable_category = cfg.enable_category
+        self.enable_attribute = cfg.enable_attribute
+        self.num_lane_categories = cfg.num_lane_categories
+        self.num_lr_attributes = cfg.num_lr_attributes
+        self.scale_factor = cfg.scale_factor
+        self.detailed_loss_logger = cfg.get("detailed_loss_logger", None)
+        if (
+            self.detailed_loss_logger is None
+            and cfg.get("detailed_loss_logger_config") is not None
+        ):
+            conf = cfg.get("detailed_loss_logger_config")
+            self.detailed_loss_logger = DetailedLossLogger(
+                output_dir=conf.output_dir, filename=conf.filename
+            )
+        self.img_w = self.cfg.img_w
+        self.img_h = self.cfg.img_h
         self.n_strips = num_points - 1
         self.n_offsets = num_points
         self.num_priors = num_priors
@@ -51,41 +58,30 @@ class LLANetHead(nn.Module):
         self.fc_hidden_dim = fc_hidden_dim
 
         # Dynamic weight scheduling parameters
-        self.epoch_per_iter = getattr(cfg, "epoch_per_iter", 1)
-        self.warmup_epochs = getattr(cfg, "warmup_epochs", 5)
-
-        self.start_cls_loss_weight = getattr(cfg, "start_cls_loss_weight", 0.0)
-        self.cls_loss_weight = getattr(cfg, "cls_loss_weight", 2.0)
-
-        self.start_category_loss_weight = getattr(
-            cfg, "start_category_loss_weight", 0.0
-        )
-        self.category_loss_weight = getattr(cfg, "category_loss_weight", 1.0)
-
-        self.start_attribute_loss_weight = getattr(
-            cfg, "start_attribute_loss_weight", 0.0
-        )
-        self.attribute_loss_weight = getattr(cfg, "attribute_loss_weight", 0.5)
-
-        # Buffers
-        self.register_buffer(
-            "sample_x_indexs",
-            (
-                torch.linspace(0, 1, steps=self.sample_points, dtype=torch.float32)
-                * self.n_strips
-            ).long(),
-        )
-
-        self.register_buffer(
-            "prior_feat_ys",
-            torch.linspace(1.0, 0.0, steps=self.sample_points).float(),
-        )
-        self.register_buffer(
-            "prior_ys",
-            torch.linspace(1.0, 0.0, steps=self.n_offsets, dtype=torch.float32),
-        )
+        self.epoch_per_iter = cfg.epoch_per_iter
+        self.warmup_epochs = cfg.warmup_epochs
+        self.start_cls_loss_weight = cfg.start_cls_loss_weight
+        self.cls_loss_weight = cfg.cls_loss_weight
+        self.start_category_loss_weight = cfg.start_category_loss_weight
+        self.category_loss_weight = cfg.category_loss_weight
+        self.start_attribute_loss_weight = cfg.start_attribute_loss_weight
+        self.attribute_loss_weight = cfg.attribute_loss_weight
+        self.dataset_statistics = cfg.dataset_statistics
+        self.logger = logging.getLogger("unlanedet")  # 获取 logger 实例
+        self.stats_data = None
+        if self.dataset_statistics and os.path.exists(self.dataset_statistics):
+            try:
+                self.stats_data = np.load(self.dataset_statistics, allow_pickle=True)
+                self.logger.info(
+                    f"Loaded dataset statistics: {self.dataset_statistics}"
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to load dataset statistics: {e}")
 
         self.prior_feat_channels = prior_feat_channels
+        # Buffers
+        self.__init_buffers()
+
         self._init_prior_embeddings()
         init_priors, priors_on_featmap = self.generate_priors_from_embeddings()
         self.register_buffer("priors", init_priors)
@@ -115,9 +111,7 @@ class LLANetHead(nn.Module):
         self.reg_layers = nn.Linear(self.fc_hidden_dim, self.n_offsets + 1 + 2 + 1)
         self.cls_layers = nn.Linear(self.fc_hidden_dim, 2)
 
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        nn.init.constant_(self.cls_layers.bias, bias_value)
+        # Initial bias for cls_layers will be set in init_weights
 
         if self.enable_category:
             self.category_modules = nn.ModuleList(
@@ -153,81 +147,247 @@ class LLANetHead(nn.Module):
         )
 
         if self.enable_category:
-            self.category_criterion = torch.nn.NLLLoss(reduction="sum")
+            cat_weights = None
+            if (
+                self.stats_data is not None
+                and "cls_category_weights" in self.stats_data
+            ):
+                cat_weights = torch.tensor(
+                    self.stats_data["cls_category_weights"], dtype=torch.float32
+                )
+                self.logger.info("Using statistics for category loss weights.")
+            self.category_criterion = torch.nn.NLLLoss(
+                weight=cat_weights, reduction="sum"
+            )
+
         if self.enable_attribute:
             self.attribute_criterion = torch.nn.NLLLoss(reduction="sum")
 
         self.init_weights()
 
+    def __init_buffers(self):
+        self.register_buffer(
+            name="sample_x_indexs",
+            tensor=(
+                torch.linspace(0, 1, steps=self.sample_points, dtype=torch.float32)
+                * self.n_strips
+            ).long(),
+        )
+        use_pdf = False
+        if self.stats_data is not None:
+            try:
+                has_y = (
+                    "start_y_grid" in self.stats_data
+                    and "start_y_pdf" in self.stats_data
+                )
+                has_x = (
+                    "start_x_grid" in self.stats_data
+                    and "start_x_pdf" in self.stats_data
+                )
+                if has_y:
+                    y_grid = np.array(self.stats_data["start_y_grid"]).astype(
+                        np.float32
+                    )
+                    y_pdf = np.array(self.stats_data["start_y_pdf"]).astype(np.float32)
+                    y_grid = np.clip(y_grid, 0.0, 1.0)
+                    y_pdf = np.maximum(y_pdf, 0.0)
+                    y_pdf_sum = (
+                        float(np.sum(y_pdf)) if float(np.sum(y_pdf)) > 0 else 1.0
+                    )
+                    y_cdf = np.cumsum(y_pdf) / y_pdf_sum
+                    q_feat = np.linspace(0.0, 1.0, self.sample_points, dtype=np.float32)
+                    q_off = np.linspace(0.0, 1.0, self.n_offsets, dtype=np.float32)
+                    y_feat = np.interp(q_feat, y_cdf, y_grid)
+                    y_off = np.interp(q_off, y_cdf, y_grid)
+                    y_feat = y_feat[::-1]
+                    y_off = y_off[::-1]
+                    self.register_buffer(
+                        name="prior_feat_ys", tensor=torch.from_numpy(y_feat).float()
+                    )
+                    self.register_buffer(
+                        name="prior_ys", tensor=torch.from_numpy(y_off).float()
+                    )
+                    self.register_buffer(
+                        name="start_y_pdf_grid", tensor=torch.from_numpy(y_grid).float()
+                    )
+                    self.register_buffer(
+                        name="start_y_pdf", tensor=torch.from_numpy(y_pdf).float()
+                    )
+                    use_pdf = True
+                    self.logger.info(
+                        f"Init prior Y buffers from PDF: feat_points={self.sample_points}, offsets={self.n_offsets}"
+                    )
+                if has_x:
+                    x_grid = np.array(self.stats_data["start_x_grid"]).astype(
+                        np.float32
+                    )
+                    x_pdf = np.array(self.stats_data["start_x_pdf"]).astype(np.float32)
+                    x_grid = np.clip(x_grid, 0.0, 1.0)
+                    x_pdf = np.maximum(x_pdf, 0.0)
+                    self.register_buffer(
+                        name="start_x_pdf_grid", tensor=torch.from_numpy(x_grid).float()
+                    )
+                    self.register_buffer(
+                        name="start_x_pdf", tensor=torch.from_numpy(x_pdf).float()
+                    )
+                    self.logger.info("Registered start X PDF buffers.")
+            except Exception as e:
+                self.logger.warning(f"Init buffers from PDF failed: {e}")
+        if not use_pdf:
+            self.register_buffer(
+                name="prior_feat_ys",
+                tensor=torch.linspace(1.0, 0.0, steps=self.sample_points).float(),
+            )
+            self.register_buffer(
+                name="prior_ys",
+                tensor=torch.linspace(
+                    1.0, 0.0, steps=self.n_offsets, dtype=torch.float32
+                ),
+            )
+            self.logger.info("Init prior Y buffers using uniform linspace.")
+        self.logger.info(
+            f"Init buffers: sample_points={self.sample_points}, n_offsets={self.n_offsets}"
+        )
+        self.logger.info(
+            f"Buffer shapes: sample_x_indexs={self.sample_x_indexs.shape}, prior_feat_ys={self.prior_feat_ys.shape}, prior_ys={self.prior_ys.shape}"
+        )
+
     def init_weights(self):
-        for m in self.cls_layers.parameters():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=1e-3)
-                prior_prob = 0.01
-                bias_value = -math.log((1 - prior_prob) / prior_prob)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, bias_value)
-            else:
-                nn.init.normal_(m, mean=0.0, std=1e-3)
+        # Initialize cls_layers (Single Linear layer)
+        if isinstance(self.cls_layers, nn.Linear):
+            nn.init.normal_(self.cls_layers.weight, mean=0.0, std=1e-3)
 
-        for m in self.reg_layers.parameters():
-            nn.init.normal_(m, mean=0.0, std=1e-3)
+            # Use statistics for bias initialization
+            prior_prob = 0.01
+            if self.stats_data is not None and "seg_positive_ratios" in self.stats_data:
+                try:
+                    pos_ratios = self.stats_data["seg_positive_ratios"]
+                    if len(pos_ratios) > 0:
+                        prior_prob = float(np.mean(pos_ratios))
+                        prior_prob = max(1e-4, min(1.0 - 1e-4, prior_prob))
+                        self.logger.info(
+                            f"Init cls bias using prior seg_positive_ratios, prior_prob={prior_prob:.5f}"
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error reading seg_positive_ratios: {e}")
 
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            if self.cls_layers.bias is not None:
+                nn.init.constant_(self.cls_layers.bias, bias_value)
+                self.logger.info(f"Init cls bias to {bias_value:.5f}")
+
+        # Initialize reg_layers (Single Linear layer)
+        if isinstance(self.reg_layers, nn.Linear):
+            nn.init.normal_(self.reg_layers.weight, mean=0.0, std=1e-3)
+            if self.reg_layers.bias is not None:
+                nn.init.constant_(self.reg_layers.bias, 0)
+        if hasattr(self, "priors"):
+            try:
+                p = self.priors
+                start_y_mean = float(p[:, 2].mean().item())
+                start_x_mean = float(p[:, 3].mean().item())
+                theta_mean = float(p[:, 4].mean().item())
+                length_mean = float(p[:, 5].mean().item())
+                self.logger.info(
+                    f"Priors summary: y_mean={start_y_mean:.4f}, x_mean={start_x_mean:.4f}, theta_mean={theta_mean:.4f}, length_mean={length_mean:.4f}"
+                )
+            except Exception as e:
+                self.logger.warning(f"Log priors summary failed: {e}")
+
+        # Initialize category_modules (ModuleList)
         if self.enable_category:
-            for m in self.category_modules.parameters():
+            for m in self.category_modules:
                 if isinstance(m, nn.Linear):
-                    nn.init.normal_(m, mean=0.0, std=1e-3)
-        if self.enable_attribute:
-            for m in self.attribute_layers.parameters():
-                nn.init.normal_(m, mean=0.0, std=1e-3)
+                    nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
 
-    def _init_prior_embeddings(self):
-        # [start_y, start_x, theta]
+        # Initialize attribute_layers (Linear)
+        if self.enable_attribute:
+            if isinstance(self.attribute_layers, nn.Linear):
+                nn.init.normal_(self.attribute_layers.weight, mean=0.0, std=1e-3)
+                if self.attribute_layers.bias is not None:
+                    nn.init.constant_(self.attribute_layers.bias, 0)
+            # Also init attribute_modules if they exist (ModuleList)
+            if hasattr(self, "attribute_modules"):
+                for m in self.attribute_modules:
+                    if isinstance(m, nn.Linear):
+                        nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+                        if m.bias is not None:
+                            nn.init.constant_(m.bias, 0)
+
+    def _init_prior_embeddings_default(self):
+
+        # [start_y, start_x, theta] -> all normalize
         self.prior_embeddings = nn.Embedding(self.num_priors, 3)
 
-        # 【关键修复】Prior 初始化策略 (仿照 CLRNet)
-        # 不再全部初始化在底部，而是均匀分布在 Y 轴和 X 轴
-        # 0 ~ N-1
-        with torch.no_grad():
-            # Y: 均匀分布 [0.0, 1.0]
-            # X: 均匀分布 [0.0, 1.0]
-            # Theta: 0.5 (垂直)
+        bottom_priors_nums = self.num_priors * 3 // 4
+        left_priors_nums, _ = self.num_priors // 8, self.num_priors // 8
 
-            # 分层初始化：底部 Prior 和 左/右 Prior
-            # 这里简化为全图均匀分布，这对于 OpenLane 这种多样化场景更稳健
-
-            # Start Y: 0.0 (Top) -> 1.0 (Bottom)
-            # 我们让大部分 Prior 集中在底部 (0.5 - 1.0)，少部分在中间
-            bottom_priors = int(self.num_priors * 0.7)
-            mid_priors = self.num_priors - bottom_priors
-
-            # Bottom Priors: Y=1.0, X=0~1
-            self.prior_embeddings.weight[:bottom_priors, 0] = 1.0
-            self.prior_embeddings.weight[:bottom_priors, 1] = torch.linspace(
-                0, 1, bottom_priors
+        strip_size = 0.5 / (left_priors_nums // 2 - 1)
+        bottom_strip_size = 1 / (bottom_priors_nums // 4 + 1)
+        for i in range(left_priors_nums):
+            nn.init.constant_(self.prior_embeddings.weight[i, 0], (i // 2) * strip_size)
+            nn.init.constant_(self.prior_embeddings.weight[i, 1], 0.0)
+            nn.init.constant_(
+                self.prior_embeddings.weight[i, 2], 0.16 if i % 2 == 0 else 0.32
             )
-            self.prior_embeddings.weight[:bottom_priors, 2] = 0.5
 
-            # Mid Priors: Y=0.4~0.9, X=0~1
-            self.prior_embeddings.weight[bottom_priors:, 0] = torch.linspace(
-                0.4, 0.9, mid_priors
+        for i in range(left_priors_nums, left_priors_nums + bottom_priors_nums):
+            nn.init.constant_(self.prior_embeddings.weight[i, 0], 0.0)
+            nn.init.constant_(
+                self.prior_embeddings.weight[i, 1],
+                ((i - left_priors_nums) // 4 + 1) * bottom_strip_size,
             )
-            self.prior_embeddings.weight[bottom_priors:, 1] = torch.linspace(
-                0, 1, mid_priors
+            nn.init.constant_(self.prior_embeddings.weight[i, 2], 0.2 * (i % 4 + 1))
+
+        for i in range(left_priors_nums + bottom_priors_nums, self.num_priors):
+            nn.init.constant_(
+                self.prior_embeddings.weight[i, 0],
+                ((i - left_priors_nums - bottom_priors_nums) // 2) * strip_size,
             )
-            self.prior_embeddings.weight[bottom_priors:, 2] = 0.5
+            nn.init.constant_(self.prior_embeddings.weight[i, 1], 1.0)
+            nn.init.constant_(
+                self.prior_embeddings.weight[i, 2], 0.68 if i % 2 == 0 else 0.84
+            )
+
+    def _init_prior_embeddings(self):
+        # 尝试使用已加载的统计数据
+        success = False
+        if self.stats_data is not None:
+            try:
+                if "cluster_centers" in self.stats_data:
+                    # 必须先创建 embedding
+                    self.prior_embeddings = nn.Embedding(self.num_priors, 3)
+                    cluster_centers = self.stats_data["cluster_centers"]
+                    init_prior_embeddings_with_stats(
+                        self.prior_embeddings,
+                        cluster_centers,
+                        stats=self.stats_data,
+                        img_w=self.img_w,
+                        img_h=self.img_h,
+                    )
+                    success = True
+                    self.logger.info("Initialized prior embeddings from statistics.")
+                else:
+                    self.logger.warning(
+                        "'cluster_centers' not found in statistics data."
+                    )
+            except Exception as e:
+                self.logger.error(f"Error initializing priors from stats: {e}.")
+
+        if not success:
+            self.logger.info("Using default prior embeddings initialization.")
+            self._init_prior_embeddings_default()
 
     def generate_priors_from_embeddings(self):
         device = self.prior_embeddings.weight.device
+        # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, 72 coordinates, score[0] = negative prob, score[1] = positive prob
         priors = torch.zeros((self.num_priors, 6 + self.n_offsets), device=device)
 
-        # 从 embedding 加载初始参数
-        # prediction = embedding.weight
         priors[:, 2:5] = self.prior_embeddings.weight.clone()  # y, x, theta
-        priors[:, 5] = 0.3  # Initial length
+        priors[:, 5] = 77.946186 / 270  # Initial length, mean length
 
-        # 初始点坐标 (垂直投影)
-        # x = start_x (因为 theta=0.5, tan=inf, dx=0)
         for i in range(self.num_priors):
             priors[i, 6:] = priors[i, 3]  # start_x
 
@@ -242,7 +402,8 @@ class LLANetHead(nn.Module):
         )
 
         prior_xs = prior_xs * 2.0 - 1.0
-        prior_ys = prior_ys * 2.0 - 1.0
+        # Flip Y for grid_sample: Model 0.0 (Bottom) -> GridSample 1.0 (Bottom)
+        prior_ys = (1.0 - prior_ys) * 2.0 - 1.0
 
         grid = torch.cat((prior_xs, prior_ys), dim=-1)
         feature = F.grid_sample(batch_features, grid, align_corners=True)
@@ -314,10 +475,10 @@ class LLANetHead(nn.Module):
             )
 
             # 1. Gradient Flow: Calculate Raw Params
-            pred_start_y = priors[:, :, 0] + reg[:, :, 0]
-            pred_start_x = priors[:, :, 1] + reg[:, :, 1]
-            pred_theta = priors[:, :, 2] + reg[:, :, 2]
-            pred_len = reg[:, :, 3]
+            pred_start_y = priors[:, :, 2] + reg[:, :, 0]
+            pred_start_x = priors[:, :, 3] + reg[:, :, 1]
+            pred_theta = priors[:, :, 4] + reg[:, :, 2]
+            pred_len = priors[:, :, 5] + reg[:, :, 3]
 
             # 2. Stop Gradient: Clamp for Projection Safety
             clamped_start_y = torch.clamp(pred_start_y, 0.0, 1.0)
@@ -512,9 +673,7 @@ class LLANetHead(nn.Module):
 
                 pos_preds = predictions[batch_idx, prior_idx]
                 pos_targets = batch_targets[batch_idx, target_idx]
-
-                # ============ 量纲对齐 ============
-                reg_yxtl = pos_preds[:, 2:6].clone()
+                reg_yxtl = pos_preds[:, 2:6]  # .clone()
                 reg_yxtl[:, 0] *= self.n_strips
                 reg_yxtl[:, 1] *= self.img_w - 1
                 reg_yxtl[:, 2] *= 180
@@ -522,12 +681,50 @@ class LLANetHead(nn.Module):
 
                 target_yxtl = pos_targets[:, 2:6].clone()
                 target_yxtl[:, 0] *= self.n_strips
-                target_yxtl[:, 1] *= self.img_w - 1
                 target_yxtl[:, 2] *= 180
-                target_yxtl[:, 3] *= self.n_strips
 
-                # 【Length】Direct Regression (No Residual)
-                # target_yxtl[:, 3] = target_yxtl[:, 3]
+                with torch.no_grad():
+                    predictions_starts = torch.clamp(
+                        (pos_preds[:, 2] * self.n_strips).round().long(),
+                        0,
+                        self.n_strips,
+                    )
+                    target_starts = (pos_targets[:, 2] * self.n_strips).round().long()
+                    target_yxtl[:, 3] -= predictions_starts - target_starts
+                    target_yxtl[:, 3] = torch.clamp(target_yxtl[:, 3], min=0)
+
+                # DEBUG: Print loss components stats
+                if current_iter % 100 == 0 and torch.distributed.get_rank() == 0:
+                    with torch.no_grad():
+                        self.logger.info(f"Iter {current_iter} Stage {stage} Stats:")
+                        self.logger.info(
+                            f"  Reg Y: Pred Mean={reg_yxtl[:,0].mean():.2f}, Tgt Mean={target_yxtl[:,0].mean():.2f}"
+                        )
+                        self.logger.info(
+                            f"  Reg X: Pred Mean={reg_yxtl[:,1].mean():.2f}, Tgt Mean={target_yxtl[:,1].mean():.2f}"
+                        )
+                        self.logger.info(
+                            f"  Reg Theta: Pred Mean={reg_yxtl[:,2].mean():.2f}, Tgt Mean={target_yxtl[:,2].mean():.2f}"
+                        )
+                        self.logger.info(
+                            f"  Reg Len: Pred Mean={reg_yxtl[:,3].mean():.2f}, Tgt Mean={target_yxtl[:,3].mean():.2f}"
+                        )
+
+                        l_y = F.smooth_l1_loss(
+                            reg_yxtl[:, 0], target_yxtl[:, 0], reduction="none"
+                        ).mean()
+                        l_x = F.smooth_l1_loss(
+                            reg_yxtl[:, 1], target_yxtl[:, 1], reduction="none"
+                        ).mean()
+                        l_t = F.smooth_l1_loss(
+                            reg_yxtl[:, 2], target_yxtl[:, 2], reduction="none"
+                        ).mean()
+                        l_l = F.smooth_l1_loss(
+                            reg_yxtl[:, 3], target_yxtl[:, 3], reduction="none"
+                        ).mean()
+                        self.logger.info(
+                            f"  Loss Comp (Avg/Match): Y={l_y:.4f}, X={l_x:.4f}, Theta={l_t:.4f}, Len={l_l:.4f}"
+                        )
 
                 loss_y = F.smooth_l1_loss(
                     reg_yxtl[:, 0], target_yxtl[:, 0], reduction="none"
@@ -546,9 +743,7 @@ class LLANetHead(nn.Module):
                 loss_components = torch.stack(
                     [loss_y, loss_x, loss_theta, loss_len], dim=1
                 )
-                total_reg_xytl_loss += (loss_components * reg_weights).sum() / max(
-                    num_positives, 1
-                )
+                total_reg_xytl_loss += (loss_components * reg_weights).mean()
 
                 if self.detailed_loss_logger is not None:
                     log_ly += loss_y.mean()
@@ -561,9 +756,6 @@ class LLANetHead(nn.Module):
                 line_pred = pos_preds[:, 6:] * (self.img_w - 1)
                 line_target = pos_targets[:, 6:] * (self.img_w - 1)
 
-                # 【Fix】处理 Target 中的无效点 (-1e5)
-                # liou_loss 内部通常有 valid_mask 处理，但最好确保传入的有效值
-                # 这里假设 liou_loss 处理 -1e5 为 invalid
                 ious = line_iou(
                     line_pred, line_target, self.img_w, length=15, aligned=True
                 )

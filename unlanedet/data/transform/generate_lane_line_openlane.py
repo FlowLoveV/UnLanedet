@@ -56,7 +56,7 @@ class GenerateLaneLineOpenLane(object):
         self.n_strips = cfg.num_points - 1
         self.strip_size = self.img_h / self.n_strips
         self.max_lanes = cfg.max_lanes
-        
+
         # Y轴坐标：从底部(img_h)到顶部(0)
         self.offsets_ys = np.linspace(self.img_h, 0, self.num_points)
         self.training = training
@@ -116,9 +116,9 @@ class GenerateLaneLineOpenLane(object):
         points = np.array(points)
         if len(points) < 2:
             raise Exception("Too few points")
-            
+
         x, y = points[:, 0], points[:, 1]
-        
+
         if visibility is not None:
             vis = np.array(visibility)
             if len(vis) != len(x):
@@ -143,16 +143,16 @@ class GenerateLaneLineOpenLane(object):
 
         all_xs = np.interp(sample_ys, unique_y, unique_x, left=-1e5, right=-1e5)
         all_vis = np.interp(sample_ys, unique_y, unique_vis, left=0.0, right=0.0)
-        
+
         return all_xs, all_vis
 
     def transform_annotation(self, anno, img_wh):
         old_lanes = anno["lanes"]
         old_visibilities = anno.get("lane_vis", [])
-        
+
         old_categories = anno.get("lane_categories", [0] * len(old_lanes))
         old_attributes = anno.get("lane_attributes", [0] * len(old_lanes))
-        
+
         if not old_visibilities or len(old_visibilities) != len(old_lanes):
             old_visibilities = [None] * len(old_lanes)
 
@@ -163,78 +163,82 @@ class GenerateLaneLineOpenLane(object):
         old_attributes = [old_attributes[i] for i in valid_indices]
 
         if len(old_lanes) > 0:
-            combined = list(zip(old_lanes, old_visibilities, old_categories, old_attributes))
+            combined = list(
+                zip(old_lanes, old_visibilities, old_categories, old_attributes)
+            )
             combined.sort(key=lambda x: -x[0][0][1] if len(x[0]) > 0 else 0)
             old_lanes, old_visibilities, old_categories, old_attributes = zip(*combined)
 
-        lanes = np.ones((self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32) * -1e5
+        lanes = (
+            np.ones(
+                (self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32
+            )
+            * -1e5
+        )
         lanes_endpoints = np.ones((self.max_lanes, 2))
-        lanes_vis_interpolated = np.zeros((self.max_lanes, self.n_offsets), dtype=np.float32)
+        lanes_vis_interpolated = np.zeros(
+            (self.max_lanes, self.n_offsets), dtype=np.float32
+        )
         padded_categories = np.zeros(self.max_lanes, dtype=np.int64)
         padded_attributes = np.zeros(self.max_lanes, dtype=np.int64)
-        
-        lanes[:, 0] = 1 
+
+        lanes[:, 0] = 1
         lanes[:, 1] = 0
 
         for lane_idx, lane in enumerate(old_lanes):
             if lane_idx >= self.max_lanes:
                 break
-            
+
             visibility = old_visibilities[lane_idx]
 
             try:
                 all_xs, all_vis = self.sample_lane(lane, self.offsets_ys, visibility)
             except Exception:
                 continue
-            
             valid_mask = (all_xs >= 0) & (all_xs < self.img_w)
-            
             if valid_mask.sum() < 2:
                 continue
-                
             valid_indices = np.where(valid_mask)[0]
-            start_index = valid_indices[0] 
+            start_index = valid_indices[0]
             xs_inside = all_xs[valid_mask]
-            
             lanes[lane_idx, 0] = 0
             lanes[lane_idx, 1] = 1
-
             # 1. Start Y
-            lanes[lane_idx, 2] = self.offsets_ys[start_index] / self.img_h
-            
+            lanes[lane_idx, 2] = start_index / self.n_strips
             # 2. Start X
-            lanes[lane_idx, 3] = xs_inside[0] / self.img_w
-
+            lanes[lane_idx, 3] = xs_inside[0]
             # 3. Theta (全局计算，更稳健)
             # 使用起点和终点计算整体斜率
             x_start = xs_inside[0]
             x_end = xs_inside[-1]
             y_start = self.offsets_ys[start_index]
             y_end = self.offsets_ys[start_index + len(xs_inside) - 1]
-            
+
             dx = x_end - x_start
-            dy = y_end - y_start # 注意：OpenLane中y向上是减小，但这里我们用物理距离
+            dy = y_end - y_start  # 注意：OpenLane中y向上是减小，但这里我们用物理距离
             # 实际上我们希望 Theta 0.5 对应垂直。
             # 如果 dy 用 y_index 的差值 (正数)，dx (正为右)。
             # dy_phys = len * strip_size
             dy_phys = (len(xs_inside) - 1) * self.strip_size
-            
+
             theta = 0.5 + math.atan2(dx, dy_phys) / math.pi
             lanes[lane_idx, 4] = theta
 
             # 4. Length
-            lanes[lane_idx, 5] = len(xs_inside) / self.n_strips
+            lanes[lane_idx, 5] = len(xs_inside)
 
             # 5. Points
             target_indices_slice = lanes[lane_idx, 6:]
             target_indices_slice[valid_mask] = xs_inside / self.img_w
             lanes[lane_idx, 6:] = target_indices_slice
-            
+
             lanes_vis_interpolated[lane_idx, :] = all_vis
 
-            lanes_endpoints[lane_idx, 0] = (start_index + len(xs_inside) - 1) / self.n_strips
+            lanes_endpoints[lane_idx, 0] = (
+                start_index + len(xs_inside) - 1
+            ) / self.n_strips
             lanes_endpoints[lane_idx, 1] = xs_inside[-1] / self.img_w
-            
+
             padded_categories[lane_idx] = old_categories[lane_idx]
             padded_attributes[lane_idx] = old_attributes[lane_idx]
 
@@ -244,14 +248,14 @@ class GenerateLaneLineOpenLane(object):
             "lane_vis_interpolated": lanes_vis_interpolated,
             "lanes": old_lanes,
             "padded_categories": padded_categories,
-            "padded_attributes": padded_attributes
+            "padded_attributes": padded_attributes,
         }
         return new_anno
 
     def __call__(self, sample):
         img_org = sample["img"]
         img_h_curr, img_w_curr = img_org.shape[:2]
-        
+
         line_strings_org = self.lane_to_linestrings(sample["lanes"])
         line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
 
@@ -259,7 +263,7 @@ class GenerateLaneLineOpenLane(object):
         mask_org = SegmentationMapsOnImage(dummy_mask_arr, shape=img_org.shape)
 
         success = False
-        
+
         for i in range(30):
             try:
                 if self.training:
@@ -273,41 +277,50 @@ class GenerateLaneLineOpenLane(object):
                         image=img_org.copy().astype(np.uint8),
                         line_strings=line_strings_org,
                     )
-                
+
                 aug_lanes = self.linestrings_to_lanes(line_strings)
                 current_vis = sample.get("lane_vis", [])
-                
+
                 new_anno_input = {
-                    "lanes": aug_lanes, 
+                    "lanes": aug_lanes,
                     "lane_vis": current_vis,
                     "lane_categories": sample.get("lane_categories", []),
-                    "lane_attributes": sample.get("lane_attributes", [])
+                    "lane_attributes": sample.get("lane_attributes", []),
                 }
-                
+
                 annos = self.transform_annotation(
                     new_anno_input, img_wh=(self.img_w, self.img_h)
                 )
-                
+
                 label = annos["label"]
                 lane_endpoints = annos["lane_endpoints"]
                 lane_vis_interpolated = annos["lane_vis_interpolated"]
-                
+
                 if np.sum(label[:, 1] == 1) > 0:
-                     success = True
-                     break
-                     
-                if i > 10: 
                     success = True
                     break
-                    
+
+                if i > 10:
+                    success = True
+                    break
+
             except Exception:
                 continue
 
         if not success:
-            label = np.ones((self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32) * -1e5
-            label[:, 0] = 1; label[:, 1] = 0
+            label = (
+                np.ones(
+                    (self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets),
+                    dtype=np.float32,
+                )
+                * -1e5
+            )
+            label[:, 0] = 1
+            label[:, 1] = 0
             lane_endpoints = np.zeros((self.max_lanes, 2))
-            lane_vis_interpolated = np.zeros((self.max_lanes, self.n_offsets), dtype=np.float32)
+            lane_vis_interpolated = np.zeros(
+                (self.max_lanes, self.n_offsets), dtype=np.float32
+            )
             padded_categories = np.zeros(self.max_lanes, dtype=np.int64)
             padded_attributes = np.zeros(self.max_lanes, dtype=np.int64)
             new_anno_input = {"lanes": sample["lanes"]}
@@ -323,14 +336,16 @@ class GenerateLaneLineOpenLane(object):
         sample["lanes_endpoints"] = lane_endpoints
         sample["lane_vis_interpolated"] = lane_vis_interpolated
         sample["gt_points"] = new_anno_input["lanes"]
-        
+
         sample["lane_categories"] = padded_categories
         sample["lane_attributes"] = padded_attributes
 
         if self.enable_3d and "lanes_3d" in sample:
             sample["lanes_3d"] = sample["lanes_3d"]
-            if "intrinsic" in sample: sample["intrinsic"] = sample["intrinsic"]
-            if "extrinsic" in sample: sample["extrinsic"] = sample["extrinsic"]
+            if "intrinsic" in sample:
+                sample["intrinsic"] = sample["intrinsic"]
+            if "extrinsic" in sample:
+                sample["extrinsic"] = sample["extrinsic"]
 
         mask_scale = 8
         mask_h, mask_w = int(self.img_h // mask_scale), int(self.img_w // mask_scale)
