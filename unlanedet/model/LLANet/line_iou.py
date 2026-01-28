@@ -3,7 +3,7 @@ import torch
 
 def line_iou(pred, target, img_w, length=15, aligned=True):
     """
-    Calculate the line iou value between predictions and targets.
+    Calculate the line iou value between predictions and targets
     Args:
         pred: lane predictions, shape: (num_pred, 72)
         target: ground truth, shape: (num_target, 72)
@@ -15,38 +15,38 @@ def line_iou(pred, target, img_w, length=15, aligned=True):
     px2 = pred + length
     tx1 = target - length
     tx2 = target + length
-
     if aligned:
-        # One-to-one mapping
         invalid_mask = target
         ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
+        ovr = torch.clamp(ovr, min=0.0)
         union = torch.max(px2, tx2) - torch.min(px1, tx1)
     else:
-        # Many-to-many mapping (Broadcasting)
-        # pred: [N, 1, 72]
-        # target: [1, M, 72]
-        px1 = px1.unsqueeze(1)
-        px2 = px2.unsqueeze(1)
-        tx1 = tx1.unsqueeze(0)
-        tx2 = tx2.unsqueeze(0)
+        if pred.dim() == 2:
+            num_pred = pred.shape[0]
+            invalid_mask = target.repeat(num_pred, 1, 1)
+            ovr = torch.min(px2[:, None, :], tx2[None, ...]) - torch.max(
+                px1[:, None, :], tx1[None, ...]
+            )
+            union = torch.max(px2[:, None, :], tx2[None, ...]) - torch.min(
+                px1[:, None, :], tx1[None, ...]
+            )
+        else:
+            # Batch mode: pred [B, N, L], target [B, M, L]
+            num_pred = pred.shape[1]
+            invalid_mask = target.unsqueeze(1).expand(-1, num_pred, -1, -1)
 
-        # invalid_mask should follow target's validity
-        invalid_mask = target.unsqueeze(0).expand(
-            pred.shape[0], target.shape[0], target.shape[1]
-        )
+            px2 = px2.unsqueeze(2)  # [B, N, 1, L]
+            tx2 = tx2.unsqueeze(1)  # [B, 1, M, L]
+            px1 = px1.unsqueeze(2)
+            tx1 = tx1.unsqueeze(1)
 
-        ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
-        union = torch.max(px2, tx2) - torch.min(px1, tx1)
+            ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
+            ovr = torch.clamp(ovr, min=0.0)
+            union = torch.max(px2, tx2) - torch.min(px1, tx1)
 
-    # Clean up invalid regions
     invalid_masks = (invalid_mask < 0) | (invalid_mask >= img_w)
-
-    # Use relu to handle non-overlapping cases (negative ovr)
-    # Note: Use non-inplace relu to preserve computational graph
-    ovr = torch.nn.functional.relu(ovr - 1e-9) + 1e-9  # slight offset to avoid zero
-    ovr = torch.where(invalid_masks, torch.zeros_like(ovr), ovr)
-    union = torch.where(invalid_masks, torch.zeros_like(union), union)
-
+    ovr[invalid_masks] = 0.0
+    union[invalid_masks] = 0.0
     iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
     return iou
 
@@ -65,7 +65,7 @@ class LLANetIouLoss(torch.nn.Module):
             weight (float): loss weight.
             lane_width (float): virtual lane half-width.
         """
-        super(CLRNetIoULoss, self).__init__()
+        super(LLANetIouLoss, self).__init__()
         self.loss_weight = loss_weight
         self.lane_width = lane_width
 

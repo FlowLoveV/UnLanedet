@@ -16,6 +16,8 @@ from .dynamic_assign import assign
 from .roi_gather import ROIGather, LinearModule
 from .prior import init_prior_embeddings_with_stats
 from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
+from unlanedet.model.module.core.lane import Lane
+from unlanedet.layers.ops import nms
 
 
 class LLANetHead(nn.Module):
@@ -152,10 +154,18 @@ class LLANetHead(nn.Module):
                 self.stats_data is not None
                 and "cls_category_weights" in self.stats_data
             ):
-                cat_weights = torch.tensor(
+                # The loaded weights are actually frequencies. We need to invert them to get proper loss weights.
+                freqs = torch.tensor(
                     self.stats_data["cls_category_weights"], dtype=torch.float32
                 )
-                self.logger.info("Using statistics for category loss weights.")
+                # Invert: 1 / (freq + epsilon)
+                cat_weights = 1.0 / (freqs + 1e-6)
+                # Normalize so mean is 1
+                cat_weights = cat_weights / cat_weights.mean()
+
+                self.logger.info(
+                    f"Using statistics for category loss weights. Weights: {cat_weights}"
+                )
             self.category_criterion = torch.nn.NLLLoss(
                 weight=cat_weights, reduction="sum"
             )
@@ -166,6 +176,7 @@ class LLANetHead(nn.Module):
         self.init_weights()
 
     def __init_buffers(self):
+        # sample_x_indexs: sample points for ROI Gather (Top-to-Bottom: 0 -> n_strips)
         self.register_buffer(
             name="sample_x_indexs",
             tensor=(
@@ -199,13 +210,17 @@ class LLANetHead(nn.Module):
                     q_off = np.linspace(0.0, 1.0, self.n_offsets, dtype=np.float32)
                     y_feat = np.interp(q_feat, y_cdf, y_grid)
                     y_off = np.interp(q_off, y_cdf, y_grid)
-                    y_feat = y_feat[::-1]
-                    y_off = y_off[::-1]
+                    # prior_feat_ys: sample points for ROI Gather (Top-to-Bottom: 0 -> 1)
+                    # prior_ys: physical y-coordinates for regression/IoU (Bottom-to-Top: 1 -> 0)
+                    # This matches self.offsets_ys = np.linspace(self.img_h, 0, self.num_points) in generate_lane_line_openlane.py
+                    # which maps index 0 to img_h (Bottom) and index n_offsets-1 to 0 (Top).
+                    # Normalized: index 0 -> 1.0 (Bottom), index n_offsets-1 -> 0.0 (Top).
                     self.register_buffer(
-                        name="prior_feat_ys", tensor=torch.from_numpy(y_feat).float()
+                        name="prior_feat_ys",
+                        tensor=torch.from_numpy(y_feat).float(),
                     )
                     self.register_buffer(
-                        name="prior_ys", tensor=torch.from_numpy(y_off).float()
+                        name="prior_ys", tensor=torch.from_numpy(1.0 - y_off).float()
                     )
                     self.register_buffer(
                         name="start_y_pdf_grid", tensor=torch.from_numpy(y_grid).float()
@@ -236,7 +251,9 @@ class LLANetHead(nn.Module):
         if not use_pdf:
             self.register_buffer(
                 name="prior_feat_ys",
-                tensor=torch.linspace(1.0, 0.0, steps=self.sample_points).float(),
+                tensor=torch.flip(
+                    (1 - self.sample_x_indexs.float() / self.n_strips), dims=[-1]
+                ),
             )
             self.register_buffer(
                 name="prior_ys",
@@ -244,7 +261,9 @@ class LLANetHead(nn.Module):
                     1.0, 0.0, steps=self.n_offsets, dtype=torch.float32
                 ),
             )
-            self.logger.info("Init prior Y buffers using uniform linspace.")
+            self.logger.info(
+                "Init prior Y buffers using uniform linspace (Top-to-Bottom)."
+            )
         self.logger.info(
             f"Init buffers: sample_points={self.sample_points}, n_offsets={self.n_offsets}"
         )
@@ -352,33 +371,12 @@ class LLANetHead(nn.Module):
             )
 
     def _init_prior_embeddings(self):
-        # 尝试使用已加载的统计数据
-        success = False
-        if self.stats_data is not None:
-            try:
-                if "cluster_centers" in self.stats_data:
-                    # 必须先创建 embedding
-                    self.prior_embeddings = nn.Embedding(self.num_priors, 3)
-                    cluster_centers = self.stats_data["cluster_centers"]
-                    init_prior_embeddings_with_stats(
-                        self.prior_embeddings,
-                        cluster_centers,
-                        stats=self.stats_data,
-                        img_w=self.img_w,
-                        img_h=self.img_h,
-                    )
-                    success = True
-                    self.logger.info("Initialized prior embeddings from statistics.")
-                else:
-                    self.logger.warning(
-                        "'cluster_centers' not found in statistics data."
-                    )
-            except Exception as e:
-                self.logger.error(f"Error initializing priors from stats: {e}.")
-
-        if not success:
-            self.logger.info("Using default prior embeddings initialization.")
-            self._init_prior_embeddings_default()
+        # Force default initialization to match CLRNet
+        # self.stats_data check removed to ensure parity with CLRNet's heuristic initialization
+        self.logger.info(
+            "Using default prior embeddings initialization (CLRNet style)."
+        )
+        self._init_prior_embeddings_default()
 
     def generate_priors_from_embeddings(self):
         device = self.prior_embeddings.weight.device
@@ -386,10 +384,34 @@ class LLANetHead(nn.Module):
         priors = torch.zeros((self.num_priors, 6 + self.n_offsets), device=device)
 
         priors[:, 2:5] = self.prior_embeddings.weight.clone()  # y, x, theta
-        priors[:, 5] = 77.946186 / 270  # Initial length, mean length
 
-        for i in range(self.num_priors):
-            priors[i, 6:] = priors[i, 3]  # start_x
+        # In CLRNet, length (index 5) is initialized to 0 (implicit in zeros)
+        # LLANet previously set it to 0.5 or mean_len, but since we use direct regression (pred_len = reg),
+        # the prior length value is ignored during decoding.
+        # We leave it as 0 to match CLRNet's state.
+        priors[:, 5] = 0.0
+
+        # CLRNet-style geometric projection for priors
+        # Calculate x coordinates based on start_x, start_y, theta
+        # LLANet start_y is Coordinate (0=Top, 1=Bottom)
+        # prior_ys is (1=Bottom, 0=Top)
+        # dy = prior_ys - start_y
+        priors[:, 6:] = (
+            priors[:, 3].unsqueeze(1).clone().repeat(1, self.n_offsets)
+            * (self.img_w - 1)
+            + (
+                (
+                    self.prior_ys.repeat(self.num_priors, 1).to(device)
+                    - priors[:, 2].unsqueeze(1).clone().repeat(1, self.n_offsets)
+                )
+                * self.img_h
+                / torch.tan(
+                    priors[:, 4].unsqueeze(1).clone().repeat(1, self.n_offsets)
+                    * math.pi
+                    + 1e-5
+                )
+            )
+        ) / (self.img_w - 1)
 
         priors_on_featmap = priors[..., 6 + self.sample_x_indexs]
         return priors, priors_on_featmap
@@ -402,10 +424,13 @@ class LLANetHead(nn.Module):
         )
 
         prior_xs = prior_xs * 2.0 - 1.0
-        # Flip Y for grid_sample: Model 0.0 (Bottom) -> GridSample 1.0 (Bottom)
-        prior_ys = (1.0 - prior_ys) * 2.0 - 1.0
+        # Flip Y for grid_sample:
+        # Model Y is 0~1 (0=Top, 1=Bottom). GridSample Y is -1(Top) ~ 1(Bottom).
+        # We want: 1.0 (Bottom) -> 1.0; 0.0 (Top) -> -1.0.
+        # Formula: grid_y = prior_ys * 2.0 - 1.0
+        grid_y = (prior_ys * 2.0) - 1.0
 
-        grid = torch.cat((prior_xs, prior_ys), dim=-1)
+        grid = torch.cat((prior_xs, grid_y), dim=-1)
         feature = F.grid_sample(batch_features, grid, align_corners=True)
         feature = feature.permute(0, 2, 1, 3).reshape(
             batch_size * num_priors, self.prior_feat_channels, self.sample_points, 1
@@ -441,6 +466,13 @@ class LLANetHead(nn.Module):
 
         for stage in range(self.refine_layers):
             num_priors = priors_on_featmap.shape[1]
+            # priors_on_featmap is [N, n_offsets] -> [N, sample_points] via sample_x_indexs
+            # sample_x_indexs is [0, ..., n_strips] (Top to Bottom)
+            # prior_xs: [B, N, sample_points]
+
+            # priors_on_featmap is Bottom-to-Top (from generate_priors_from_embeddings)
+            # prior_feat_ys is Top-to-Bottom (0->1)
+            # So we need to flip prior_xs to match prior_feat_ys (Top-to-Bottom)
             prior_xs = torch.flip(priors_on_featmap, dims=[2])
 
             batch_prior_features = self.pool_prior_features(
@@ -451,13 +483,11 @@ class LLANetHead(nn.Module):
             fc_features = self.roi_gather(
                 prior_features_stages, batch_features[stage], stage
             )
-            fc_features = (
-                fc_features.view(num_priors, batch_size, -1)
-                .permute(1, 0, 2)
-                .contiguous()
-            )
+
             if stage == self.refine_layers - 1:
                 final_fc_features = fc_features
+
+            # Flatten (B, N, C) -> (B*N, C) without scrambling
             fc_features_flat = fc_features.view(
                 batch_size * num_priors, self.fc_hidden_dim
             )
@@ -478,13 +508,16 @@ class LLANetHead(nn.Module):
             pred_start_y = priors[:, :, 2] + reg[:, :, 0]
             pred_start_x = priors[:, :, 3] + reg[:, :, 1]
             pred_theta = priors[:, :, 4] + reg[:, :, 2]
-            pred_len = priors[:, :, 5] + reg[:, :, 3]
+            pred_len = reg[:, :, 3]  # Direct prediction like CLRNet
+            pred_len = torch.clamp(pred_len, min=1e-3)
 
             # 2. Stop Gradient: Clamp for Projection Safety
             clamped_start_y = torch.clamp(pred_start_y, 0.0, 1.0)
             clamped_start_x = torch.clamp(pred_start_x, 0.0, 1.0)
             clamped_theta = pred_theta  # Theta can be outside 0-1 slightly
-            clamped_len = torch.clamp(pred_len, 0.0, 1.0)
+            clamped_len = (
+                pred_len  # Length is unnormalized (points), do not clamp to 1.0
+            )
 
             # 3. Geometric Projection
             def tran_tensor(t):
@@ -494,10 +527,14 @@ class LLANetHead(nn.Module):
             pred_start_x_exp = tran_tensor(clamped_start_x)
             pred_theta_exp = tran_tensor(clamped_theta)
 
+            # prior_ys is [1.0, ..., 0.0] (Bottom to Top)
+            # (pred_start_y - prior_ys) * H: vertical distance from start point (Bottom) to current row (Top)
+            # If prior_ys > pred_start_y (row is below start point), distance is negative.
+            # tan(theta * pi): theta=0.5 (vertical) -> dx=0
             coords = (
                 pred_start_x_exp * (self.img_w - 1)
                 + (
-                    (self.prior_ys.repeat(batch_size, num_priors, 1) - pred_start_y_exp)
+                    (pred_start_y_exp - prior_ys_expanded)
                     * self.img_h
                     / torch.tan(pred_theta_exp * math.pi + 1e-5)
                 )
@@ -573,26 +610,105 @@ class LLANetHead(nn.Module):
                 outputs["attribute"] = attribute_out
             return outputs
         else:
-            ret_list = []
-            batch_size = final_preds.shape[0]
-            if category_out is not None:
-                category_out = category_out.view(batch_size, self.num_priors, -1)
+            return {"lane_lines": final_preds}
 
-            for i in range(batch_size):
-                sample_ret = {
-                    "lane_lines": self.predictions_to_pred(final_preds[i].unsqueeze(0))
-                }
-                if category_out is not None:
-                    sample_ret["category"] = category_out[i]
-                if attribute_out is not None:
-                    sample_ret["attribute"] = attribute_out[i]
-                ret_list.append(sample_ret)
-            return ret_list
+    def get_lanes(self, output, as_lanes=True):
+        """
+        Convert model output to lanes.
+        """
+        softmax = nn.Softmax(dim=1)
+
+        decoded = []
+        for predictions in output:
+            # filter out the conf lower than conf threshold
+            if self.cfg.test_parameters.conf_threshold is not None:
+                threshold = self.cfg.test_parameters.conf_threshold
+            else:
+                threshold = 0.4
+
+            scores = softmax(predictions[:, :2])[:, 1]
+            keep_inds = scores >= threshold
+            predictions = predictions[keep_inds]
+            scores = scores[keep_inds]
+
+            if predictions.shape[0] == 0:
+                decoded.append([])
+                continue
+            nms_predictions = predictions.detach().clone()
+            nms_predictions = torch.cat(
+                [nms_predictions[..., :4], nms_predictions[..., 5:]], dim=-1
+            )
+            nms_predictions[..., 4] = nms_predictions[..., 4] * self.n_strips
+            nms_predictions[..., 5:] = nms_predictions[..., 5:] * (self.img_w - 1)
+
+            keep, num_to_keep, _ = nms(
+                nms_predictions,
+                scores,
+                overlap=self.cfg.test_parameters.nms_thres,
+                top_k=self.cfg.max_lanes,
+            )
+            keep = keep[:num_to_keep]
+            predictions = predictions[keep]
+
+            if predictions.shape[0] == 0:
+                decoded.append([])
+                continue
+
+            predictions[:, 5] = torch.round(predictions[:, 5] * self.n_strips)
+            if as_lanes:
+                pred = self.predictions_to_pred(predictions)
+            else:
+                pred = predictions
+            decoded.append(pred)
+
+        return decoded
 
     def predictions_to_pred(self, predictions):
+        """
+        Convert predictions to internal Lane structure for evaluation.
+        """
+        self.prior_ys = self.prior_ys.to(predictions.device)
+        self.prior_ys = self.prior_ys.double()
         lanes = []
         for lane in predictions:
-            lane = lane.detach().cpu().numpy()
+            lane_xs = lane[6:]  # normalized value
+            start = min(
+                max(0, int(round(lane[2].item() * self.n_strips))), self.n_strips
+            )
+            length = int(round(lane[5].item()))
+            end = start + length - 1
+            end = min(end, len(self.prior_ys) - 1)
+            # end = label_end
+            # if the prediction does not start at the bottom of the image,
+            # extend its prediction until the x is outside the image
+            mask = ~(
+                (
+                    ((lane_xs[:start] >= 0.0) & (lane_xs[:start] <= 1.0))
+                    .cpu()
+                    .numpy()[::-1]
+                    .cumprod()[::-1]
+                ).astype(bool)
+            )
+            lane_xs[end + 1 :] = -2
+            lane_xs[:start][mask] = -2
+            lane_ys = self.prior_ys[lane_xs >= 0]
+            lane_xs = lane_xs[lane_xs >= 0]
+            lane_xs = lane_xs.flip(0).double()
+            lane_ys = lane_ys.flip(0)
+
+            lane_ys = (
+                lane_ys * (self.cfg.ori_img_h - self.cfg.cut_height)
+                + self.cfg.cut_height
+            ) / self.cfg.ori_img_h
+            if len(lane_xs) <= 1:
+                continue
+            points = torch.stack(
+                (lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1
+            ).squeeze(2)
+            lane = Lane(
+                points=points.cpu().numpy(),
+                metadata={"start_x": lane[3], "start_y": lane[2], "conf": lane[1]},
+            )
             lanes.append(lane)
         return lanes
 
@@ -657,6 +773,7 @@ class LLANetHead(nn.Module):
                     self.img_h,
                     self.cfg,
                     current_iter=current_iter,
+                    prior_ys=self.prior_ys,
                 )
 
             cls_targets = assigned_mask.long().view(-1)
@@ -673,7 +790,10 @@ class LLANetHead(nn.Module):
 
                 pos_preds = predictions[batch_idx, prior_idx]
                 pos_targets = batch_targets[batch_idx, target_idx]
-                reg_yxtl = pos_preds[:, 2:6]  # .clone()
+
+                # Calculate Scaled Stats for Loss and Logging (CLRNet style)
+                # Use scaled values for loss calculation as per user instruction "Do not normalize xytl_loss"
+                reg_yxtl = pos_preds[:, 2:6].clone()
                 reg_yxtl[:, 0] *= self.n_strips
                 reg_yxtl[:, 1] *= self.img_w - 1
                 reg_yxtl[:, 2] *= 180
@@ -681,50 +801,17 @@ class LLANetHead(nn.Module):
 
                 target_yxtl = pos_targets[:, 2:6].clone()
                 target_yxtl[:, 0] *= self.n_strips
+                target_yxtl[:, 1] *= self.img_w - 1
                 target_yxtl[:, 2] *= 180
+                target_yxtl[:, 3] *= self.n_strips
 
                 with torch.no_grad():
-                    predictions_starts = torch.clamp(
-                        (pos_preds[:, 2] * self.n_strips).round().long(),
-                        0,
-                        self.n_strips,
-                    )
-                    target_starts = (pos_targets[:, 2] * self.n_strips).round().long()
-                    target_yxtl[:, 3] -= predictions_starts - target_starts
+                    # Adjust target length for start position difference
+                    # LLANet: start_y is 0=Top, 1=Bottom (decreases upwards)
+                    # pred < target (Higher) -> diff < 0
+                    # length should decrease -> len += diff
+                    target_yxtl[:, 3] -= reg_yxtl[:, 0] - target_yxtl[:, 0]
                     target_yxtl[:, 3] = torch.clamp(target_yxtl[:, 3], min=0)
-
-                # DEBUG: Print loss components stats
-                if current_iter % 100 == 0 and torch.distributed.get_rank() == 0:
-                    with torch.no_grad():
-                        self.logger.info(f"Iter {current_iter} Stage {stage} Stats:")
-                        self.logger.info(
-                            f"  Reg Y: Pred Mean={reg_yxtl[:,0].mean():.2f}, Tgt Mean={target_yxtl[:,0].mean():.2f}"
-                        )
-                        self.logger.info(
-                            f"  Reg X: Pred Mean={reg_yxtl[:,1].mean():.2f}, Tgt Mean={target_yxtl[:,1].mean():.2f}"
-                        )
-                        self.logger.info(
-                            f"  Reg Theta: Pred Mean={reg_yxtl[:,2].mean():.2f}, Tgt Mean={target_yxtl[:,2].mean():.2f}"
-                        )
-                        self.logger.info(
-                            f"  Reg Len: Pred Mean={reg_yxtl[:,3].mean():.2f}, Tgt Mean={target_yxtl[:,3].mean():.2f}"
-                        )
-
-                        l_y = F.smooth_l1_loss(
-                            reg_yxtl[:, 0], target_yxtl[:, 0], reduction="none"
-                        ).mean()
-                        l_x = F.smooth_l1_loss(
-                            reg_yxtl[:, 1], target_yxtl[:, 1], reduction="none"
-                        ).mean()
-                        l_t = F.smooth_l1_loss(
-                            reg_yxtl[:, 2], target_yxtl[:, 2], reduction="none"
-                        ).mean()
-                        l_l = F.smooth_l1_loss(
-                            reg_yxtl[:, 3], target_yxtl[:, 3], reduction="none"
-                        ).mean()
-                        self.logger.info(
-                            f"  Loss Comp (Avg/Match): Y={l_y:.4f}, X={l_x:.4f}, Theta={l_t:.4f}, Len={l_l:.4f}"
-                        )
 
                 loss_y = F.smooth_l1_loss(
                     reg_yxtl[:, 0], target_yxtl[:, 0], reduction="none"
@@ -745,21 +832,65 @@ class LLANetHead(nn.Module):
                 )
                 total_reg_xytl_loss += (loss_components * reg_weights).mean()
 
+                # DEBUG: Print loss components stats
+                if current_iter % 100 == 0 and torch.distributed.get_rank() == 0:
+                    with torch.no_grad():
+                        self.logger.info(f"Iter {current_iter} Stage {stage} Stats:")
+                        self.logger.info(
+                            f"  Reg Y: Pred Mean={reg_yxtl[:,0].mean():.2f}, Tgt Mean={target_yxtl[:,0].mean():.2f}"
+                        )
+                        self.logger.info(
+                            f"  Reg X: Pred Mean={reg_yxtl[:,1].mean():.2f}, Tgt Mean={target_yxtl[:,1].mean():.2f}"
+                        )
+                        self.logger.info(
+                            f"  Reg Theta: Pred Mean={reg_yxtl[:,2].mean():.2f}, Tgt Mean={target_yxtl[:,2].mean():.2f}"
+                        )
+                        self.logger.info(
+                            f"  Reg Len: Pred Mean={reg_yxtl[:,3].mean():.2f}, Tgt Mean={target_yxtl[:,3].mean():.2f}"
+                        )
+
+                        l_y_scaled = loss_y.mean().item()
+                        l_x_scaled = loss_x.mean().item()
+                        l_t_scaled = loss_theta.mean().item()
+                        l_l_scaled = loss_len.mean().item()
+
+                        self.logger.info(
+                            f"  Loss Comp (Scaled Avg): Y={l_y_scaled:.4f}, X={l_x_scaled:.4f}, Theta={l_t_scaled:.4f}, Len={l_l_scaled:.4f}"
+                        )
+
                 if self.detailed_loss_logger is not None:
+                    # Log the normalized losses for consistency with optimization
                     log_ly += loss_y.mean()
                     log_lx += loss_x.mean()
                     log_lt += loss_theta.mean()
                     log_ll += loss_len.mean()
                     total_stage_count += 1
 
-                # IoU Loss (Target Masking)
+                # IoU Loss
+                # Line IoU Loss
                 line_pred = pos_preds[:, 6:] * (self.img_w - 1)
                 line_target = pos_targets[:, 6:] * (self.img_w - 1)
 
                 ious = line_iou(
-                    line_pred, line_target, self.img_w, length=15, aligned=True
+                    line_pred,
+                    line_target,
+                    self.img_w,
+                    length=15,
+                    aligned=True,
                 )
                 total_iou_loss += (1 - ious).mean()
+                ious_raw = line_iou(
+                    line_pred,
+                    line_target,
+                    self.img_w,
+                    length=15,
+                    aligned=True,
+                )
+                if current_iter % 100 == 0 and torch.distributed.get_rank() == 0:
+                    with torch.no_grad():
+                        self.logger.info(
+                            f"  IoU Mean: Masked={(ious.mean().item()):.4f}, Raw={(ious_raw.mean().item()):.4f}"
+                        )
 
                 # ================== 【增强版可视化】 ==================
                 if (
@@ -771,7 +902,7 @@ class LLANetHead(nn.Module):
                     import cv2
                     import numpy as np
 
-                    save_dir = "debug_vis"
+                    save_dir = "/data1/lxy_log/workspace/ms/UnLanedet/debug_vis"
                     os.makedirs(save_dir, exist_ok=True)
                     vis_txt_path = os.path.join(save_dir, f"iter_{current_iter}.txt")
 
@@ -827,13 +958,9 @@ class LLANetHead(nn.Module):
                                 points = []
                                 for idx_pt, x in enumerate(pts_x):
                                     if x > 0 and x < 1:
-                                        y = (
-                                            int(
-                                                self.img_h
-                                                * (1.0 - idx_pt / (self.n_offsets - 1))
-                                            )
-                                            + pad
-                                        )
+                                        # Use prior_ys for visualization to match physical coordinates
+                                        y_norm = self.prior_ys[idx_pt].item()
+                                        y = int(self.img_h * y_norm) + pad
                                         x_pixel = int(x * self.img_w) + pad
                                         points.append((x_pixel, y))
                                 if len(points) > 1:
@@ -920,13 +1047,9 @@ class LLANetHead(nn.Module):
                                 points = []
                                 for idx_pt, x in enumerate(points_x):
                                     if x > 0 and x < 1:
-                                        y = (
-                                            int(
-                                                self.img_h
-                                                * (1.0 - idx_pt / (self.n_offsets - 1))
-                                            )
-                                            + pad
-                                        )
+                                        # Use prior_ys for visualization to match physical coordinates
+                                        y_norm = self.prior_ys[idx_pt].item()
+                                        y = int(self.img_h * y_norm) + pad
                                         x_pixel = int(x * self.img_w) + pad
                                         points.append((x_pixel, y))
 
@@ -980,9 +1103,13 @@ class LLANetHead(nn.Module):
                     ):
                         cat_preds = outputs["category"][assigned_mask]
                         cat_targets = batch_lane_categories[batch_idx, target_idx]
-                        total_category_loss += self.category_criterion(
-                            cat_preds.log_softmax(dim=-1), cat_targets
-                        ) / max(batch_size, 1)
+                        # Use log_softmax for NLLLoss if not already applied
+                        total_category_loss += (
+                            self.category_criterion(
+                                F.log_softmax(cat_preds, dim=-1), cat_targets
+                            )
+                            / cls_norm
+                        )
 
                     if (
                         self.enable_attribute
@@ -991,9 +1118,12 @@ class LLANetHead(nn.Module):
                     ):
                         attr_preds = outputs["attribute"][assigned_mask]
                         attr_targets = batch_lane_attributes[batch_idx, target_idx]
-                        total_attribute_loss += self.attribute_criterion(
-                            attr_preds.log_softmax(dim=-1), attr_targets
-                        ) / max(batch_size, 1)
+                        total_attribute_loss += (
+                            self.attribute_criterion(
+                                F.log_softmax(attr_preds, dim=-1), attr_targets
+                            )
+                            / cls_norm
+                        )
 
         seg_loss = torch.tensor(0.0, device=device)
         if outputs.get("seg", None) is not None and batch.get("seg", None) is not None:

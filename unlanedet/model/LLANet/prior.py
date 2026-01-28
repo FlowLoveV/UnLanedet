@@ -18,8 +18,8 @@ def init_prior_embeddings_with_stats(
     n_clusters = len(cluster_centers)
 
     centers_x = cluster_centers[:, 0] / img_w
-    centers_y = 1.0 - cluster_centers[:, 1] / img_h
-    centers_theta = cluster_centers[:, 2]
+    centers_y = cluster_centers[:, 1] / img_h
+    centers_theta = cluster_centers[:, 2] / 180.0
 
     centers_tensor = torch.stack(
         [

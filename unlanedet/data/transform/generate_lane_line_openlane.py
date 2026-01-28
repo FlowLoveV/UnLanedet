@@ -204,9 +204,12 @@ class GenerateLaneLineOpenLane(object):
             lanes[lane_idx, 0] = 0
             lanes[lane_idx, 1] = 1
             # 1. Start Y
-            lanes[lane_idx, 2] = start_index / self.n_strips
+            # Normalize y_start to 0~1 (0=Top, 1=Bottom) per unituniform.md
+            # y_start in pixels (0 at Top, H at Bottom)
+            y_start_phys = self.offsets_ys[start_index]
+            lanes[lane_idx, 2] = y_start_phys / self.img_h
             # 2. Start X
-            lanes[lane_idx, 3] = xs_inside[0]
+            lanes[lane_idx, 3] = xs_inside[0] / self.img_w
             # 3. Theta (全局计算，更稳健)
             # 使用起点和终点计算整体斜率
             x_start = xs_inside[0]
@@ -225,7 +228,7 @@ class GenerateLaneLineOpenLane(object):
             lanes[lane_idx, 4] = theta
 
             # 4. Length
-            lanes[lane_idx, 5] = len(xs_inside)
+            lanes[lane_idx, 5] = len(xs_inside) / self.n_strips
 
             # 5. Points
             target_indices_slice = lanes[lane_idx, 6:]

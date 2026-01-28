@@ -69,7 +69,7 @@ num_priors = 96  # 车道线候选框数目
 num_lane_categories = 15  # 车道线类别数目
 num_lr_attributes = 4  # 车道线左右属性数目
 
-test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
+test_parameters = dict(conf_threshold=0.5, nms_thres=20, nms_topk=max_lanes)
 
 ori_img_w = 1920
 ori_img_h = 1280
@@ -147,7 +147,7 @@ param_config.featuremap_out_channel = 64  # neck 层输出通道数目
 param_config.fc_hidden_dim = 64  # head层 全连接层隐藏层维度
 param_config.output_dir = train.output_dir  # 输出目录，用于保存模型和日志
 param_config.epoch_per_iter = epoch_per_iter  # 每个epoch的迭代次数
-param_config.assign_method = "CLRNet"  # assign方法，可选 GeometryAware or CLRNet
+param_config.assign_method = assign_method_name
 param_config.pretrained_model_name = "mobilenetv4_conv_medium"  # 预训练模型名称
 param_config.enable_category = True
 param_config.enable_attribute = True
@@ -222,7 +222,7 @@ val_process = [
         training=False,
         cfg=param_config,
     ),
-    L(ToTensor)(keys=["img"]),
+    L(ToTensor)(keys=["img"], collect_keys=["img_name", "img_path"]),
 ]
 
 # Dataloader

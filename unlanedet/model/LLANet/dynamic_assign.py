@@ -4,6 +4,33 @@ import torch.nn.functional as F
 from .line_iou import line_iou
 
 
+def focal_cost(cls_pred, gt_labels, alpha=0.25, gamma=2, eps=1e-12):
+    """
+    Args:
+        cls_pred (Tensor): Predicted classification logits, shape
+            [num_query, num_class] or [batch, num_query, num_class].
+        gt_labels (Tensor): Label of `gt_bboxes`, shape (num_gt,) or [batch, num_gt].
+
+    Returns:
+        torch.Tensor: cls_cost value
+    """
+    cls_pred = cls_pred.sigmoid()
+    neg_cost = -(1 - cls_pred + eps).log() * (1 - alpha) * cls_pred.pow(gamma)
+    pos_cost = -(cls_pred + eps).log() * alpha * (1 - cls_pred).pow(gamma)
+
+    if cls_pred.dim() == 3:
+        # Batch mode: [B, N, C] vs [B, M]
+        gt_labels_expanded = gt_labels.unsqueeze(1).expand(
+            -1, cls_pred.shape[1], -1
+        )  # [B, N, M]
+        cls_cost = pos_cost.gather(2, gt_labels_expanded) - neg_cost.gather(
+            2, gt_labels_expanded
+        )
+    else:
+        cls_cost = pos_cost[:, gt_labels] - neg_cost[:, gt_labels]
+    return cls_cost
+
+
 class GeometryAwareAssign(nn.Module):
     """
     [方案 A] 几何感知动态分配器 (Geometry-Enhanced SimOTA) - 加法 Cost 模型
@@ -26,7 +53,9 @@ class GeometryAwareAssign(nn.Module):
         self.w_dist = 1.0
         self.w_theta = 2.0
 
-    def forward(self, preds, targets, masks, img_w, img_h, current_iter=0):
+    def forward(
+        self, preds, targets, masks, img_w, img_h, current_iter=0, prior_ys=None
+    ):
         # 动态权重计算
         # warmup_iters = self.warmup_epochs * self.epoch_per_iter
         # if current_iter < warmup_iters:
@@ -64,9 +93,19 @@ class GeometryAwareAssign(nn.Module):
         # ========================================
 
         # A.1 起始点欧氏距离
-        delta_x = pred_start_x.unsqueeze(2) - gt_start_x.unsqueeze(1)
-        delta_y = pred_start_y.unsqueeze(2) - gt_start_y.unsqueeze(1)
+        # pred_start_x is normalized, gt_start_x is normalized
+        # Both pred_start_x and gt_start_x are normalized to 0-1
+        pred_start_x_pixel = pred_start_x * (img_w - 1)
+        gt_start_x_pixel = gt_start_x * (img_w - 1)
+
+        delta_x = pred_start_x_pixel.unsqueeze(2) - gt_start_x_pixel.unsqueeze(1)
+
+        # Scale Y to pixel space (gt_start_y is index/n_strips, normalized)
+        # pred_start_y is normalized (0-1), gt_start_y is normalized (0-1)
+        delta_y = (pred_start_y.unsqueeze(2) - gt_start_y.unsqueeze(1)) * (img_h - 1)
+
         dist_cost = torch.sqrt(delta_x.pow(2) + delta_y.pow(2) + 1e-8)
+        dist_cost = dist_cost / (img_w - 1)  # Normalize to 0-1 scale
 
         # A.2 角度差异
         theta_cost = torch.abs(pred_theta.unsqueeze(2) - gt_theta.unsqueeze(1))
@@ -83,6 +122,14 @@ class GeometryAwareAssign(nn.Module):
         pred_lines = preds[..., 6:] * (img_w - 1)
         gt_lines = targets[..., 6:] * (img_w - 1)
 
+        n_offsets = preds.shape[-1] - 6
+        offset_index = torch.arange(n_offsets, device=device).view(1, 1, -1)
+        pred_start_idx = (1.0 - pred_start_y) * (n_offsets - 1)
+        pred_len_idx = preds[..., 5] * (n_offsets - 1)
+        pred_mask = (offset_index >= pred_start_idx.unsqueeze(-1)) & (
+            offset_index <= (pred_start_idx + pred_len_idx).unsqueeze(-1)
+        )
+
         ious_list = []
         for i in range(batch_size):
             valid_gt_mask = masks[i].bool()
@@ -96,7 +143,14 @@ class GeometryAwareAssign(nn.Module):
             cur_pred = pred_lines[i]
             cur_gt = gt_lines[i, :num_valid]
 
-            l_iou = line_iou(cur_pred, cur_gt, img_w, length=15, aligned=False)
+            l_iou = line_iou(
+                cur_pred,
+                cur_gt,
+                img_w,
+                length=15,
+                aligned=False,
+                pred_mask=pred_mask[i],
+            )
             l_iou = torch.nan_to_num(l_iou, nan=0.0)
 
             # 填充到 max_targets
@@ -181,15 +235,26 @@ class CLRNetAssign(nn.Module):
         self.warmup_epochs = getattr(cfg, "warmup_epochs", 5)
         self.epoch_per_iter = getattr(cfg, "epoch_per_iter", 1)
 
-    def forward(self, preds, targets, masks, img_w, img_h, current_iter=0):
+    def forward(
+        self,
+        preds,
+        targets,
+        masks,
+        img_w,
+        img_h,
+        current_iter=0,
+        prior_ys=None,
+    ):
         device = preds.device
-        batch_size, num_priors, _ = preds.shape
-        _, max_targets, _ = targets.shape
+        batch_size = preds.shape[0]
+        num_priors = preds.shape[1]
+        num_targets = targets.shape[1]  # M
 
-        if max_targets == 0:
-            return torch.zeros(
-                (batch_size, num_priors), dtype=torch.bool, device=device
-            ), torch.full((batch_size, num_priors), -1, dtype=torch.long, device=device)
+        if num_targets == 0:
+            return (
+                torch.zeros((batch_size, num_priors), device=device, dtype=torch.bool),
+                torch.zeros((batch_size, num_priors), device=device, dtype=torch.long),
+            )
 
         # 准备输出容器
         matched_targets_matrix = torch.full(
@@ -202,99 +267,145 @@ class CLRNetAssign(nn.Module):
         preds_abs[..., 6:] *= img_w - 1  # Lane Points
 
         targets_abs = targets.clone()
-        targets_abs[..., 3] *= img_w - 1
+        targets_abs[..., 3] *= (
+            img_w - 1
+        )  # Target Start X is already normalized in generate_lane_line_openlane.py!
         targets_abs[..., 6:] *= img_w - 1
 
-        for b in range(batch_size):
-            num_gt = int(masks[b].sum())
-            if num_gt == 0:
-                continue
+        # --- Vectorized Cost Calculation ---
 
-            cur_pred = preds_abs[b]
-            cur_target = targets_abs[b, :num_gt]
+        # 1. Distance Cost (Lane Points)
+        # Target validity mask: [B, M, 72]
+        target_valid_mask = (targets_abs[..., 6:] >= 0) & (targets_abs[..., 6:] < img_w)
 
-            # --- 1. Distance Cost (Lane Points) ---
-            valid_mask = (cur_target[:, 6:] >= 0) & (cur_target[:, 6:] < img_w)
-            valid_len = valid_mask.sum(dim=1).float().clamp(min=1.0)
+        # Combined mask for distance: [B, 1, M, 72]
+        combined_mask = target_valid_mask.unsqueeze(1)
+        combined_len = combined_mask.sum(dim=3).float().clamp(min=1.0)  # [B, 1, M]
 
-            diff = torch.abs(
-                cur_pred[:, 6:].unsqueeze(1) - cur_target[:, 6:].unsqueeze(0)
+        # Diff: [B, N, 1, 72] - [B, 1, M, 72] -> [B, N, M, 72]
+        diff = torch.abs(
+            preds_abs[..., 6:].unsqueeze(2) - targets_abs[..., 6:].unsqueeze(1)
+        )
+        diff = diff * combined_mask
+        distances = diff.sum(dim=3) / combined_len  # [B, N, M]
+
+        # Max normalization per sample
+        dist_max = distances.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
+        distances_score = 1 - (distances / dist_max) + 1e-2
+
+        # 2. Start XY Cost
+        cur_pred_start = preds_abs[..., 2:4].clone()
+        cur_pred_start[..., 0] *= img_h - 1
+
+        cur_target_start = targets_abs[..., 2:4].clone()
+        cur_target_start[..., 0] *= img_h - 1
+
+        # cdist: [B, N, M]
+        start_dists = torch.cdist(cur_pred_start, cur_target_start, p=2)
+        start_max = start_dists.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
+        start_xys_score = 1 - (start_dists / start_max) + 1e-2
+
+        # 3. Theta Cost
+        cur_pred_theta = preds_abs[..., 4].unsqueeze(2)  # [B, N, 1]
+        cur_target_theta = targets_abs[..., 4].unsqueeze(1)  # [B, 1, M]
+        theta_dists = torch.abs(cur_pred_theta - cur_target_theta) * 180
+        theta_max = theta_dists.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
+        theta_score = 1 - (theta_dists / theta_max) + 1e-2
+
+        # 4. Classification Cost
+        gt_labels = targets_abs[..., 1].long()  # [B, M]
+        cls_cost = focal_cost(preds_abs[..., :2], gt_labels)  # [B, N, M]
+
+        # 5. Total Cost
+        reg_score = (
+            distances_score.clamp(min=1e-3)
+            * start_xys_score.clamp(min=1e-3)
+            * theta_score.clamp(min=1e-3)
+        )
+        total_cost = -(reg_score**2) * self.w_reg + cls_cost * 1.0
+
+        # Mask invalid targets
+        valid_targets_mask = masks.unsqueeze(1).expand(-1, num_priors, -1).bool()
+        total_cost[~valid_targets_mask] = 1e8  # Assign high cost to invalid targets
+
+        # 6. SimOTA (Dynamic K)
+        # line_iou supports batch now: [B, N, M]
+        l_iou = line_iou(
+            preds_abs[..., 6:],
+            targets_abs[..., 6:],
+            img_w,
+            length=15,
+            aligned=False,
+        )
+        l_iou = torch.nan_to_num(l_iou, nan=0.0)
+        l_iou[~valid_targets_mask] = 0.0
+
+        n_candidate_k = min(4, num_priors)
+        topk_ious, _ = torch.topk(l_iou, n_candidate_k, dim=1)  # [B, K, M]
+        dynamic_ks = torch.clamp(topk_ious.sum(1).int(), min=1)  # [B, M]
+        # Set k=0 for invalid targets to avoid matching them
+        dynamic_ks[~masks.bool()] = 0
+
+        # Vectorized SimOTA Matching
+        # Avoid synchronization: max_k is bounded by n_candidate_k
+        max_k = n_candidate_k
+
+        if max_k > 0:
+            # 1. Select Top-K priors for each target based on cost
+            # total_cost: [B, N, M] -> TopK over N -> [B, max_k, M]
+            _, topk_indices = torch.topk(total_cost, k=max_k, dim=1, largest=False)
+
+            # 2. Create selection mask based on dynamic_ks
+            # grid: [1, max_k, 1]
+            grid = torch.arange(max_k, device=device).view(1, -1, 1)
+            # selection_mask: [B, max_k, M]
+            selection_mask = grid < dynamic_ks.unsqueeze(1)
+
+            # 3. Construct matching matrix [B, N, M]
+            matching_matrix = torch.zeros(
+                (batch_size, num_priors, num_targets), device=device
             )
-            diff = diff * valid_mask.unsqueeze(0)
-            distances = diff.sum(dim=2) / valid_len.unsqueeze(0)
+            # Scatter 1.0 at topk_indices where mask is True
+            matching_matrix.scatter_(1, topk_indices, selection_mask.float())
 
-            distances_score = 1 - (distances / (torch.max(distances) + 1e-8)) + 1e-2
+            # 4. Conflict Resolution (Multiple targets matched to same prior)
+            matched_counts = matching_matrix.sum(dim=2)  # [B, N]
+            conflict_mask = matched_counts > 1  # [B, N]
 
-            # --- 2. Start XY Cost ---
-            cur_pred_start = cur_pred[:, 2:4].clone()
-            cur_pred_start[:, 0] *= img_h - 1
-            cur_target_start = cur_target[:, 2:4].clone()
-            cur_target_start[:, 0] *= img_h - 1
+            if conflict_mask.any():
+                # Find best target among matched ones for conflicted priors
+                masked_cost = total_cost.clone()
+                masked_cost[matching_matrix == 0] = float("inf")
 
-            start_dists = torch.cdist(cur_pred_start, cur_target_start, p=2)
-            start_xys_score = 1 - (start_dists / (torch.max(start_dists) + 1e-8)) + 1e-2
+                # argmin over targets
+                best_target_idx = masked_cost.argmin(dim=2)  # [B, N]
 
-            # --- 3. Theta Cost ---
-            cur_pred_theta = cur_pred[:, 4].unsqueeze(1) * 180
-            cur_target_theta = cur_target[:, 4].unsqueeze(0) * 180
-            theta_dists = torch.abs(cur_pred_theta - cur_target_theta)
-            theta_score = 1 - (theta_dists / (torch.max(theta_dists) + 1e-8)) + 1e-2
+                # Create one-hot for the winner
+                new_matches = F.one_hot(
+                    best_target_idx, num_classes=num_targets
+                ).float()
 
-            # --- 4. Classification Cost ---
-            pred_logits = cur_pred[:, :2]
-            pred_probs = pred_logits.softmax(dim=1)[:, 1]
-            cls_cost = (
-                -torch.log(pred_probs.clamp(min=1e-8)).unsqueeze(1).expand(-1, num_gt)
-            )
+                # Update conflicts
+                matching_matrix[conflict_mask] = new_matches[conflict_mask]
 
-            # --- 5. Total Cost (乘法模型) ---
-            reg_score = distances_score * start_xys_score * theta_score
-            total_cost = -(reg_score**2) * self.w_reg + cls_cost * 1.0
+            # 5. Convert to output format
+            # has_match: [B, N]
+            has_match = matching_matrix.sum(dim=2) > 0.5
+            # target_indices: [B, N]
+            target_indices = matching_matrix.argmax(dim=2)
 
-            # --- 6. SimOTA (Dynamic K) ---
-            # 【重要】这里同样要修复：传入 2D Tensor，不要 unsqueeze
-            l_iou = line_iou(
-                cur_pred[:, 6:], cur_target[:, 6:], img_w, length=15, aligned=False
-            )
-            l_iou = torch.nan_to_num(l_iou, nan=0.0)
-
-            n_candidate_k = min(4, num_priors)
-            topk_ious, _ = torch.topk(l_iou, n_candidate_k, dim=0)
-            dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)
-
-            matching_matrix = torch.zeros_like(total_cost)
-            for gt_idx in range(num_gt):
-                _, pos_idx = torch.topk(
-                    total_cost[:, gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
-                )
-                matching_matrix[pos_idx, gt_idx] = 1.0
-
-            matched_gt_counts = matching_matrix.sum(1)
-            if (matched_gt_counts > 1).sum() > 0:
-                conflict_mask = matched_gt_counts > 1
-                conflict_costs = total_cost[conflict_mask]
-                _, cost_argmin = torch.min(conflict_costs, dim=1)
-                matching_matrix[conflict_mask] = 0.0
-                matching_matrix[conflict_mask, cost_argmin] = 1.0
-
-            prior_idx, gt_idx = matching_matrix.nonzero(as_tuple=True)
-            matched_targets_matrix[b, prior_idx] = gt_idx
+            matched_targets_matrix[has_match] = target_indices[has_match]
 
         assigned_mask = matched_targets_matrix >= 0
         return assigned_mask, matched_targets_matrix
 
 
-def assign(preds, targets, masks, img_w, img_h, cfg=None, current_iter=0):
+def assign(
+    preds, targets, masks, img_w, img_h, cfg=None, current_iter=0, prior_ys=None
+):
     """
-    统一分配入口。
-    通过 config 中的 'assign_method' 参数选择分配策略。
-    默认使用 GeometryAwareAssign (加法模型)。
+    Unified assignment interface.
     """
-    method = getattr(cfg, "assign_method", "GeometryAware")  # GeometryAware or CLRNet
-
-    if method == "CLRNet":
-        assigner = CLRNetAssign(cfg)
-    else:
-        assigner = GeometryAwareAssign(cfg)
-
-    return assigner(preds, targets, masks, img_w, img_h, current_iter)
+    # Default to CLRNetAssign if not specified
+    assign_method = CLRNetAssign(cfg)
+    return assign_method(preds, targets, masks, img_w, img_h, current_iter, prior_ys)

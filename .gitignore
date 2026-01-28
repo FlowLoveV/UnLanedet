@@ -164,6 +164,7 @@ cython_debug/
 output
 assets
 monitor_logs
+vis_debug_detailed
 debug_vis
 source
 .trae

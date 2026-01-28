@@ -16,7 +16,8 @@ def lane_nms(predictions, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920)
     NMS function with coordinate scaling fix.
     """
     if nms_overlap_thresh > 1.0:
-        nms_overlap_thresh /= 100.0
+        # nms_overlap_thresh /= 100.0
+        pass
 
     keep_index = []
     sorted_scores, sorted_indices = torch.sort(scores, descending=True)
@@ -194,9 +195,10 @@ class OpenLaneEvaluator(DatasetEvaluator):
                     break
 
             if not original_rel_path:
-                self.logger.warning(
-                    f"[WARNING] Meta content (partial): {str(meta)[:200]}"
-                )
+                    )
+                    self.logger.warning(
+                        f"[WARNING] Meta content (partial): {str(meta)[:200]}"
+                    )
                 continue
 
             # 计算用于保存文件的相对路径 (去除 validation/ 前缀，防止文件夹嵌套过深)
@@ -383,7 +385,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
                             img_path = None
                             if "file_path" in content:
                                 img_path = content["file_path"]
-
+                            
                             if img_path:
                                 all_json_files.append(img_path)
                     except Exception as e:

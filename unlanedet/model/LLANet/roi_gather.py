@@ -6,10 +6,6 @@ import torch.nn.functional as F
 from ...layers import Conv2d, get_norm
 
 
-def LinearModule(hidden_dim):
-    return nn.ModuleList([nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)])
-
-
 class FeatureResize(nn.Module):
     def __init__(self, size=(10, 25)):
         super(FeatureResize, self).__init__()
@@ -156,3 +152,7 @@ class ROIGather(nn.Module):
         roi = roi + F.dropout(context, p=0.1, training=self.training)
 
         return roi
+
+
+def LinearModule(hidden_dim):
+    return [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]
