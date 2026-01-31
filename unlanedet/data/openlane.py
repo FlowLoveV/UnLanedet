@@ -97,7 +97,9 @@ class OpenLane(BaseDataset):
             print(f"从缓存加载: {self.cache_path}")
             with open(self.cache_path, "rb") as f:
                 data_infos = pickle.load(f)
-            return data_infos
+            # DEBUG: Limit to 50 samples for quick testing
+            print("DEBUG: Limiting dataset to 50 samples for testing.")
+            return data_infos[:50]
 
         print(f"生成新的缓存: {split}")
         data_infos = self._generate_cache(split)

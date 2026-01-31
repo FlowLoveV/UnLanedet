@@ -21,7 +21,7 @@ from unlanedet.layers.ops import nms
 from unlanedet.layers.ops.nms_demo import lane_nms
 
 
-class LLANetHead(nn.Module):
+class LLANetHeadWithStaticsPriors(nn.Module):
     def __init__(
         self,
         num_points=72,
@@ -33,7 +33,7 @@ class LLANetHead(nn.Module):
         sample_points=36,
         cfg=None,
     ):
-        super(LLANetHead, self).__init__()
+        super(LLANetHeadWithStaticsPriors, self).__init__()
         if cfg is None:
             raise ValueError("cfg must be provided")
         self.cfg = cfg
@@ -372,8 +372,55 @@ class LLANetHead(nn.Module):
             )
 
     def _init_prior_embeddings(self):
-        # Force default initialization to match CLRNet
-        # self.stats_data check removed to ensure parity with CLRNet's heuristic initialization
+        # Initialize priors using K-means clusters if available, otherwise default
+        self.prior_embeddings = nn.Embedding(self.num_priors, 3)
+
+        if self.stats_data is not None and "clusters" in self.stats_data:
+            try:
+                # Load from clusters (K-means result)
+                # Shape usually: [K, 6] -> [start_y, start_x, theta, length, score, ...]
+                # Or just [K, 3] for y, x, theta
+                priors = self.stats_data["clusters"]
+                self.logger.info(
+                    f"Loading {len(priors)} priors from statistics clusters."
+                )
+
+                # Convert to tensor
+                priors_tensor = torch.from_numpy(priors).float()
+
+                # Check shape compatibility
+                # We need [start_y, start_x, theta] which are indices 0, 1, 2 typically
+                # Note: CLRNet/LLANet priors are [start_y, start_x, theta]
+
+                with torch.no_grad():
+                    # We need to ensure we cover num_priors.
+                    num_clusters = len(priors_tensor)
+                    if num_clusters != self.num_priors:
+                        self.logger.warning(
+                            f"Number of clusters ({num_clusters}) != num_priors ({self.num_priors}). Using modulo indexing."
+                        )
+
+                    for i in range(self.num_priors):
+                        src_idx = i % num_clusters
+                        self.prior_embeddings.weight[i, 0] = priors_tensor[
+                            src_idx, 0
+                        ]  # start_y
+                        self.prior_embeddings.weight[i, 1] = priors_tensor[
+                            src_idx, 1
+                        ]  # start_x
+                        self.prior_embeddings.weight[i, 2] = priors_tensor[
+                            src_idx, 2
+                        ]  # theta
+
+                self.logger.info(
+                    "Successfully initialized prior embeddings from statistics."
+                )
+                return
+
+            except Exception as e:
+                self.logger.error(f"Failed to init priors from statistics: {e}")
+                self.logger.info("Falling back to default initialization.")
+
         self.logger.info(
             "Using default prior embeddings initialization (CLRNet style)."
         )
@@ -466,6 +513,7 @@ class LLANetHead(nn.Module):
             if self.prior_embeddings.weight.device != device:
                 self.prior_embeddings = self.prior_embeddings.to(device)
             self.priors, self.priors_on_featmap = self.generate_priors_from_embeddings()
+
         if self.priors.device != device:
             self.priors = self.priors.to(device)
             self.priors_on_featmap = self.priors_on_featmap.to(device)
@@ -655,20 +703,12 @@ class LLANetHead(nn.Module):
                 outputs["attribute"] = attribute_out
             return outputs
         else:
-            ret = {"lane_lines": final_preds}
-            if category_out is not None:
-                ret["category"] = category_out.view(batch_size, self.num_priors, -1)
-            if attribute_out is not None:
-                ret["attribute"] = attribute_out
-            return ret
+            return {"lane_lines": final_preds}
 
     def get_lanes(self, output, as_lanes=True):
         """
         Convert model output to lanes.
         """
-        if isinstance(output, dict):
-            output = output["lane_lines"]
-
         softmax = nn.Softmax(dim=1)
 
         decoded = []
@@ -680,26 +720,19 @@ class LLANetHead(nn.Module):
                 threshold = 0.4
 
             scores = softmax(predictions[:, :2])[:, 1]
-            # DEBUG: Print max score
-            print(f"DEBUG: Max score: {scores.max().item()}")
-
             keep_inds = scores >= threshold
 
             # Fallback: if no lanes found, take top K or lower threshold to ensure evaluation works
             if keep_inds.sum() == 0 and len(scores) > 0:
                 # Use a very low threshold to ensure we output something for evaluation
                 # This is critical for early training stages or debugging
-                print(f"DEBUG: No lanes >= {threshold}, falling back to 0.01")
                 threshold = 0.01
                 keep_inds = scores >= threshold
-
-            print(f"DEBUG: Keeping {keep_inds.sum()} lanes after threshold {threshold}")
 
             predictions = predictions[keep_inds]
             scores = scores[keep_inds]
 
             if predictions.shape[0] == 0:
-                print("DEBUG: No predictions left after filtering")
                 decoded.append([])
                 continue
             nms_predictions = predictions.detach().clone()
@@ -721,9 +754,7 @@ class LLANetHead(nn.Module):
             )
 
             num_to_keep = len(keep)
-            print(
-                f"DEBUG: Keeping {num_to_keep} lanes after Lane NMS (thres={self.cfg.test_parameters.nms_thres})"
-            )
+            # print(f"DEBUG: Keeping {num_to_keep} lanes after Lane NMS (thres={self.cfg.test_parameters.nms_thres})")
             predictions = predictions[keep]
 
             if predictions.shape[0] == 0:
@@ -1061,15 +1092,10 @@ class LLANetHead(nn.Module):
                         pad,
                         pad,
                         pad,
+                        pad,
                         cv2.BORDER_CONSTANT,
                         value=(0, 0, 0),
                     )
-
-                    # 2. 绘制 GT Prioirs (蓝色虚线) - 可选
-                    # for k in range(min(10, self.num_priors)):
-                    #    py = int(priors[0, k, 0].item() * self.img_h) + pad
-                    #    px = int(priors[0, k, 1].item() * self.img_w) + pad
-                    #    cv2.circle(img_vis, (px, py), 2, (255, 0, 0), -1)
 
                     # 3. 绘制 GT (绿色)
                     if len(targets_list) > 0:
@@ -1240,10 +1266,8 @@ class LLANetHead(nn.Module):
                         # Safety check for category targets
                         max_cat = self.cfg.num_lane_categories
                         if (cat_targets >= max_cat).any():
-                            # print(f"[LLANetHead] Warning: Invalid category targets detected! Max allowed: {max_cat-1}, Found: {cat_targets.max().item()}")
                             cat_targets = torch.clamp(cat_targets, max=max_cat - 1)
                         if (cat_targets < 0).any():
-                            # print(f"[LLANetHead] Warning: Negative category targets detected!")
                             cat_targets = torch.clamp(cat_targets, min=0)
 
                         # Use log_softmax for NLLLoss if not already applied
@@ -1265,10 +1289,8 @@ class LLANetHead(nn.Module):
                         # Safety check for attribute targets
                         max_attr = self.cfg.num_lr_attributes
                         if (attr_targets >= max_attr).any():
-                            # print(f"[LLANetHead] Warning: Invalid attribute targets detected! Max allowed: {max_attr-1}, Found: {attr_targets.max().item()}")
                             attr_targets = torch.clamp(attr_targets, max=max_attr - 1)
                         if (attr_targets < 0).any():
-                            # print(f"[LLANetHead] Warning: Negative attribute targets detected!")
                             attr_targets = torch.clamp(attr_targets, min=0)
 
                         total_attribute_loss += (
@@ -1296,7 +1318,6 @@ class LLANetHead(nn.Module):
                 # invalid if >= max_seg AND != 255
                 mask = (seg_target >= max_seg) & (seg_target != 255)
                 if mask.any():
-                    # print(f"[LLANetHead] Warning: Invalid seg targets detected! Found values >= {max_seg} (excluding 255)")
                     seg_target[mask] = 255  # Ignore invalid labels
 
             seg_loss = self.criterion(F.log_softmax(seg_pred, dim=1), seg_target)
@@ -1320,9 +1341,6 @@ class LLANetHead(nn.Module):
         alpha = current_iter / (self.warmup_epochs * self.epoch_per_iter)
         alpha = max(0.0, min(1.0, alpha))
 
-        # current_cls_loss_weight = self.start_cls_loss_weight + alpha * (
-        #     self.cls_loss_weight - self.start_cls_loss_weight
-        # )
         current_category_loss_weight = self.start_category_loss_weight + alpha * (
             self.category_loss_weight - self.start_category_loss_weight
         )

@@ -126,16 +126,36 @@ def main(args):
 
     if args.eval_only:
         model = instantiate(cfg.model)
-        logger.info(f"Instantiated model, initial device of first param: {next(model.parameters()).device}")
+        logger.info(
+            f"Instantiated model, initial device of first param: {next(model.parameters()).device}"
+        )
         model.to(cfg.train.device)
-        logger.info(f"Moved model to {cfg.train.device}, first param device now: {next(model.parameters()).device}")
+        logger.info(
+            f"Moved model to {cfg.train.device}, first param device now: {next(model.parameters()).device}"
+        )
         model = create_ddp_model(model)
         if cfg.train.init_checkpoint:
             logger.info(f"Loading checkpoint from: {cfg.train.init_checkpoint}")
             Checkpointer(model).load(cfg.train.init_checkpoint)
+
+            # SANITIZE BN STATS
+            logger.info("Sanitizing BN stats...")
+            count_fixed = 0
+            for name, m in model.named_modules():
+                if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
+                    if m.running_var is not None:
+                        # Fix negative variance
+                        if (m.running_var < 1e-5).any():
+                            # logger.warning(f"Fixed small/negative running_var in {name}")
+                            m.running_var.data.clamp_(min=1e-5)
+                            count_fixed += 1
+            logger.info(f"Fixed BN running_var in {count_fixed} modules.")
+
             # Ensure model is on correct device after loading checkpoint
             model.to(cfg.train.device)
-            logger.info(f"After loading checkpoint, first param device: {next(model.parameters()).device}")
+            logger.info(
+                f"After loading checkpoint, first param device: {next(model.parameters()).device}"
+            )
         model.eval()
         print(do_test(cfg, model))
     else:

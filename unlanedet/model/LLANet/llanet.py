@@ -27,6 +27,16 @@ class LLANet(nn.Module):
         if img.device != device:
             img = img.to(device)
 
+        # DEBUG: Check input image stats
+        import torch
+
+        if torch.isnan(img).any():
+            print("NaN detected in input image!", flush=True)
+        print(
+            f"DEBUG Input Image Stats: Min={img.min().item()}, Max={img.max().item()}, Mean={img.mean().item()}",
+            flush=True,
+        )
+
         features = self.backbone(img)
         neck_features = self.neck(features)
 
@@ -39,3 +49,6 @@ class LLANet(nn.Module):
         else:
             # During inference, forward returns predictions
             return self.head(neck_features)
+
+    def get_lanes(self, output):
+        return self.head.get_lanes(output)

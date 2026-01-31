@@ -19,7 +19,7 @@ from fvcore.common.param_scheduler import CosineParamScheduler
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 24  # ResNet34 might need smaller batch size than MobileNet
+TARGET_BATCH_PER_GPU = 12  # ResNet34 might need smaller batch size than MobileNet
 runtime_num_gpus = 2  # Default to 2
 if "--num-gpus" in sys.argv:
     try:

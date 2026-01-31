@@ -69,7 +69,7 @@ num_priors = 96  # 车道线候选框数目
 num_lane_categories = 15  # 车道线类别数目
 num_lr_attributes = 4  # 车道线左右属性数目
 
-test_parameters = dict(conf_threshold=0.2, nms_thres=0.5, nms_topk=max_lanes)
+test_parameters = dict(conf_threshold=0.5, nms_thres=20, nms_topk=max_lanes)
 
 ori_img_w = 1920
 ori_img_h = 1280
@@ -98,11 +98,6 @@ param_config.enable_3d = enable_3d
 param_config.use_pretrained_backbone = True
 param_config.iou_loss_weight = iou_loss_weight
 param_config.cls_loss_weight = cls_loss_weight
-param_config.sample_y = list(sample_y)
-param_config.img_w = img_w
-param_config.img_h = img_h
-param_config.ori_img_w = ori_img_w
-param_config.ori_img_h = ori_img_h
 param_config.xyt_loss_weight = xyt_loss_weight
 param_config.seg_loss_weight = seg_loss_weight
 param_config.category_loss_weight = category_loss_weight
@@ -145,7 +140,7 @@ total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter * 16
-train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
+train.output_dir = "./output/llanet/mobilenetv4_small_fpn_openlane/"
 
 # Model Config
 param_config.featuremap_out_channel = 64  # neck 层输出通道数目
@@ -160,6 +155,12 @@ param_config.scale_factor = 20.0
 param_config.detailed_loss_logger_config = dict(
     output_dir=param_config.output_dir, filename="detailed_metrics.json"
 )
+
+# === NEW CONFIGS FOR ABLATION ===
+param_config.head_type = "LLANetHeadWithStaticsPriors"
+param_config.neck_type = "FPN"
+# ================================
+
 model = create_llanet_model(param_config)
 
 # Optimizer Config
@@ -256,7 +257,7 @@ param_config.parse_evaluate_result_script = "tools/read_open2d_csv_results.py"
 dataloader.evaluator = L(OpenLaneEvaluator)(
     cfg=param_config,
     evaluate_bin_path="/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate",
-    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/mobilenetv4_small_gsafpn_openlane/eval_results/",
+    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/mobilenetv4_small_fpn_openlane/eval_results/",
     iou_threshold=0.5,
     width=30,
     metric="OpenLane/F1",

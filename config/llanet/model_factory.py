@@ -10,7 +10,9 @@ import torch
 from unlanedet.config import LazyCall as L
 from unlanedet.model.backbone.timm_mobilenetv4 import TimmMobileNetV4Wrapper
 from unlanedet.model.LLANet.llanet_head import LLANetHead
+from unlanedet.model.LLANet.llanet_head_with_statics_priors import LLANetHeadWithStaticsPriors
 from unlanedet.model.LLANet.gsa_fpn import GSAFPN
+from unlanedet.model.module.neck.fpn import FPN
 from unlanedet.model.LLANet.llanet import LLANet
 
 
@@ -41,6 +43,44 @@ def create_llanet_model(cfg):
     pretrained_model_name = cfg.get("pretrained_model_name", "mobilenetv4_conv_medium")
     feature_dim = cfg.get("featuremap_out_channel", 64)
     hidden_dim = cfg.get("fc_hidden_dim", feature_dim)
+    
+    # Define channel map for supported backbones
+    # mobilenetv4_conv_small: [64, 96, 960] for indices [2, 3, 4]
+    # mobilenetv4_conv_medium: [80, 160, 960] for indices [2, 3, 4]
+    backbone_channels = {
+        "mobilenetv4_conv_small": [64, 96, 960],
+        "mobilenetv4_conv_medium": [80, 160, 960],
+    }
+    
+    in_channels = backbone_channels.get(pretrained_model_name, [80, 160, 960])
+    if pretrained_model_name not in backbone_channels:
+         print(f"Warning: Unknown backbone {pretrained_model_name}, defaulting to medium channels [80, 160, 960]")
+
+    neck_type = getattr(cfg, "neck_type", "GSAFPN")
+    if neck_type == "GSAFPN":
+        neck = L(GSAFPN)(
+            in_channels=in_channels,
+            out_channels=feature_dim,
+            num_outs=3,
+            scm_kernel_size=3,
+            enable_global_semantic=True,
+        )
+    elif neck_type == "FPN":
+        neck = L(FPN)(
+            in_channels=in_channels,
+            out_channels=feature_dim,
+            num_outs=3,
+        )
+    else:
+        raise ValueError(f"Unknown neck_type: {neck_type}")
+
+    head_type = getattr(cfg, "head_type", "LLANetHead")
+    if head_type == "LLANetHead":
+        head_cls = LLANetHead
+    elif head_type == "LLANetHeadWithStaticsPriors":
+        head_cls = LLANetHeadWithStaticsPriors
+    else:
+        raise ValueError(f"Unknown head_type: {head_type}")
 
     model = L(LLANet)(
         backbone=L(TimmMobileNetV4Wrapper)(
@@ -49,14 +89,8 @@ def create_llanet_model(cfg):
             features_only=True,
             out_indices=[2, 3, 4],
         ),
-        neck=L(GSAFPN)(
-            in_channels=[80, 160, 960],
-            out_channels=feature_dim,
-            num_outs=3,
-            scm_kernel_size=3,
-            enable_global_semantic=True,
-        ),
-        head=L(LLANetHead)(
+        neck=neck,
+        head=L(head_cls)(
             num_priors=cfg.num_priors,
             refine_layers=3,
             prior_feat_channels=feature_dim,

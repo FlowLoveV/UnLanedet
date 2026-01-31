@@ -18,7 +18,6 @@ def line_iou(pred, target, img_w, length=15, aligned=True):
     if aligned:
         invalid_mask = target
         ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
-        ovr = torch.clamp(ovr, min=0.0)
         union = torch.max(px2, tx2) - torch.min(px1, tx1)
     else:
         if pred.dim() == 2:
@@ -41,7 +40,6 @@ def line_iou(pred, target, img_w, length=15, aligned=True):
             tx1 = tx1.unsqueeze(1)
 
             ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
-            ovr = torch.clamp(ovr, min=0.0)
             union = torch.max(px2, tx2) - torch.min(px1, tx1)
 
     invalid_masks = (invalid_mask < 0) | (invalid_mask >= img_w)
@@ -56,7 +54,7 @@ def liou_loss(pred, target, img_w, length=15):
 
 
 class LLANetIouLoss(torch.nn.Module):
-    def __init__(self, loss_weight=1.0, lane_width=15 / 800):
+    def __init__(self, loss_weight=1.0, lane_width=30 / 800):
         """
         LineIoU loss employed in CLRNet.
         Adapted from:
@@ -88,6 +86,7 @@ class LLANetIouLoss(torch.nn.Module):
 
         invalid_mask = target
         ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
+        ovr = torch.clamp(ovr, min=0.0)
         union = torch.max(px2, tx2) - torch.min(px1, tx1)
 
         invalid_masks = (invalid_mask < 0) | (invalid_mask >= 1.0)

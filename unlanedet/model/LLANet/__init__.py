@@ -7,6 +7,7 @@ for the FLanet lane detection framework.
 
 from .gsa_fpn import GSAFPN
 from .llanet_head import LLANetHead
+from .llanet_head_with_statics_priors import LLANetHeadWithStaticsPriors
 from .llanet import LLANet
 from .dynamic_assign import assign
 from .roi_gather import ROIGather

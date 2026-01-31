@@ -71,7 +71,7 @@ def collate(batch: Sequence, samples_per_gpu: int = 1):
                 stacked.append(
                     [sample.data for sample in batch[i:i + samples_per_gpu]])
         return DataContainer(stacked, batch[0].stack, batch[0].padding_value)
-    elif isinstance(batch[0], Sequence):
+    elif isinstance(batch[0], Sequence) and not isinstance(batch[0], (str, bytes)):
         transposed = zip(*batch)
         return [collate(samples, samples_per_gpu) for samples in transposed]
     elif isinstance(batch[0], Mapping):

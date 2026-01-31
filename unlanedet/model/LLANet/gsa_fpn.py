@@ -346,6 +346,13 @@ class GSAFPN(nn.Module):
             raise TypeError(f"inputs 必须为 list/tuple, got {type(inputs)}")
         inputs = list(inputs)
 
+        # DEBUG: Check inputs stats
+        for i, inp in enumerate(inputs):
+            inp_min = inp.min().item()
+            inp_max = inp.max().item()
+            inp_mean = inp.mean().item()
+            print(f"[GSAFPN] Input {i} stats: Min={inp_min}, Max={inp_max}, Mean={inp_mean}", flush=True)
+
         # 改进输入裁剪逻辑：按 backbone_end_level 动态选择输入特征
         assert len(inputs) >= self.backbone_end_level, (
             f"inputs 数量不足: got {len(inputs)}, expect >= {self.backbone_end_level}"
